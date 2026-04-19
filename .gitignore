@@ -1,0 +1,29 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+.python-version
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated conversion output
+Web/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
