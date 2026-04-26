@@ -16,8 +16,8 @@ Default behavior:
 - if `INPUT_DIR` is one category directory such as `Series`, it only reads that category
 - writes to `OUTPUT_DIR/Shots`, `OUTPUT_DIR/Shorts`, and `OUTPUT_DIR/Series`
 - preserves metadata
-- prefers discovered cover image files first, then embedded cover art, otherwise no cover
-- writes the chosen cover beside each output video as a `.webp` sidecar when one is available, copying existing WebP covers directly and converting other formats losslessly when possible
+- prefers discovered cover image files first, then embedded cover art, otherwise generates a thumbnail from the video at the 20 second mark, falling back to the first frame for shorter videos
+- writes the chosen or generated cover beside each output video as a `.webp` sidecar, copying existing WebP covers directly and converting other formats losslessly when possible
 - prefers NVIDIA GPU encoding when `h264_nvenc` is available, otherwise falls back to CPU
 
 Usage:

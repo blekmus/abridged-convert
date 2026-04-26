@@ -10,17 +10,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import abridged_convert.cli as cli
-from abridged_convert.cli import (
-    TerminalUI,
-    VideoEncodingConfig,
-    build_ffmpeg_command,
-    compact_label,
-    discover_jobs,
-    extract_embedded_cover,
-    main,
-    tracking_file_for_job,
-)
+import abridged_convert.conversion as conversion
+from abridged_convert.app import main
+from abridged_convert.conversion import tracking_file_for_job
+from abridged_convert.discovery import compact_label, discover_jobs
+from abridged_convert.media import build_ffmpeg_command, extract_embedded_cover, write_cover_sidecar
+from abridged_convert.models import VideoEncodingConfig
+from abridged_convert.ui import TerminalUI
 
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -216,7 +212,7 @@ class AbridgedConvertTests(unittest.TestCase):
         self.assertTrue(cover_output.exists())
         self.assertEqual(ffprobe_json(cover_output)["streams"][0]["codec_name"], "webp")
 
-    def test_series_skips_external_cover_when_no_match_is_found(self) -> None:
+    def test_series_generates_cover_when_no_external_or_embedded_cover_exists(self) -> None:
         entry = self.repo_root / "Series" / "[Creator] No Matching Covers"
         (entry / "covers").mkdir(parents=True)
         self._make_cover_image(entry / "covers" / "art-a.png", "green")
@@ -226,16 +222,22 @@ class AbridgedConvertTests(unittest.TestCase):
             title="Pilot",
             description="desc",
             comment="comment",
+            duration=21,
         )
 
-        exit_code = main(["--repo-root", str(self.repo_root), "--category", "Series"])
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(["--repo-root", str(self.repo_root), "--category", "Series"])
 
         self.assertEqual(exit_code, 0)
         output = self.repo_root / "Web" / "Series" / "[Creator] No Matching Covers" / "Episode 1 - Pilot.mp4"
         cover_output = self.repo_root / "Web" / "Series" / "[Creator] No Matching Covers" / "Episode 1 - Pilot.webp"
         probe = ffprobe_json(output)
-        self.assertEqual(len(probe["streams"]), 2)
-        self.assertFalse(cover_output.exists())
+        self.assertEqual(len(probe["streams"]), 3)
+        self.assertEqual(probe["streams"][2]["codec_name"], "png")
+        self.assertTrue(cover_output.exists())
+        self.assertEqual(ffprobe_json(cover_output)["streams"][0]["codec_name"], "webp")
+        self.assertIn("cover=generated:20s", stdout.getvalue())
 
     def test_series_prefers_exact_titled_cover_over_numeric_episode_art(self) -> None:
         entry = self.repo_root / "Series" / "[Creator] Mixed Cover Signals"
@@ -289,7 +291,7 @@ class AbridgedConvertTests(unittest.TestCase):
         self.assertEqual(probe["streams"][2]["codec_name"], "png")
         self.assertTrue(cover_output.exists())
         expected_cover_output = self.repo_root / "expected-embedded-series-cover.webp"
-        cli.write_cover_sidecar(FFMPEG, embedded_cover, expected_cover_output)
+        write_cover_sidecar(FFMPEG, embedded_cover, expected_cover_output)
         self.assertEqual(cover_output.read_bytes(), expected_cover_output.read_bytes())
 
     def test_builds_nvenc_command_when_requested(self) -> None:
@@ -449,7 +451,7 @@ class AbridgedConvertTests(unittest.TestCase):
         jobs, _ = discover_jobs(self.repo_root, ["Shots"])
         job = jobs[0]
         tracking_file = tracking_file_for_job(job)
-        original_run_command = cli.run_command
+        original_run_command = conversion.run_command
 
         def interrupting_run_command(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
             if cmd[0] == FFMPEG and cmd[-1] == str(job.output_file):
@@ -460,7 +462,7 @@ class AbridgedConvertTests(unittest.TestCase):
 
         interrupted_stdout = io.StringIO()
         interrupted_stderr = io.StringIO()
-        with mock.patch("abridged_convert.cli.run_command", side_effect=interrupting_run_command):
+        with mock.patch("abridged_convert.conversion.run_command", side_effect=interrupting_run_command):
             with redirect_stdout(interrupted_stdout), redirect_stderr(interrupted_stderr):
                 exit_code = main(["--repo-root", str(self.repo_root), "--category", "Shots"])
 
@@ -525,6 +527,7 @@ class AbridgedConvertTests(unittest.TestCase):
         add_cover_stream: Path | None = None,
         add_cover_codec: str | None = None,
         add_cover_attached_pic: bool = True,
+        duration: float = 1,
     ) -> None:
         cmd = [
             FFMPEG,
@@ -534,11 +537,11 @@ class AbridgedConvertTests(unittest.TestCase):
             "-f",
             "lavfi",
             "-i",
-            "testsrc=size=160x90:rate=12:duration=1",
+            f"testsrc=size=160x90:rate=12:duration={duration}",
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=1000:duration=1",
+            f"sine=frequency=1000:duration={duration}",
         ]
 
         if add_cover_stream is not None:

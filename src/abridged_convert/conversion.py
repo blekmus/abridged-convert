@@ -74,7 +74,14 @@ def convert_job(
 
     with tempfile.TemporaryDirectory(prefix="abridged-convert-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        cover_path, cover_source = choose_cover(job, metadata, ffmpeg_bin, temp_dir)
+        try:
+            cover_path, cover_source = choose_cover(job, metadata, ffmpeg_bin, temp_dir)
+        except ConversionError as exc:
+            result.message = str(exc)
+            return result
+        except subprocess.CalledProcessError as exc:
+            result.message = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
+            return result
         result.cover_source = cover_source
         cover_output_path = cover_output_path_for_job(job)
 

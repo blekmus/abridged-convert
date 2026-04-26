@@ -86,8 +86,12 @@ def parse_args(argv: Iterable[str]) -> tuple[argparse.ArgumentParser, argparse.N
 def resolve_cli_dirs(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[Path, Path]:
     input_dir = args.input_dir or args.legacy_input_dir
     output_dir = args.output_dir or args.legacy_output_dir
-    if input_dir is None or output_dir is None:
+    if input_dir is None:
         parser.error("the following arguments are required: input_dir, output_dir")
+    if output_dir is None:
+        if args.legacy_input_dir is None:
+            parser.error("the following arguments are required: input_dir, output_dir")
+        output_dir = input_dir / "Web"
     return input_dir.resolve(), output_dir.resolve()
 
 

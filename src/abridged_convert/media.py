@@ -10,6 +10,8 @@ from abridged_convert.cover_finder import find_best_cover
 from abridged_convert.discovery import derived_output_title, parse_entry_name
 from abridged_convert.models import ConversionError, ConversionResult, EntryMetadata, Job, VideoEncodingConfig
 
+GENERATED_THUMBNAIL_TIMESTAMP = "20"
+
 
 def run_command(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
@@ -129,6 +131,80 @@ def extract_embedded_cover(
     cmd.append(str(output_path))
     run_command(cmd)
     return output_path
+
+
+def _capture_video_frame(
+    ffmpeg_bin: str,
+    media_path: Path,
+    video_index: int,
+    timestamp: str,
+    output_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    output_path.unlink(missing_ok=True)
+    return run_command(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(media_path),
+            "-map",
+            f"0:{video_index}",
+            "-ss",
+            timestamp,
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "1",
+            str(output_path),
+        ],
+        check=False,
+    )
+
+
+def _is_decodable_image(ffmpeg_bin: str, image_path: Path) -> bool:
+    if not image_path.exists() or image_path.stat().st_size == 0:
+        return False
+    completed = run_command(
+        [
+            ffmpeg_bin,
+            "-v",
+            "error",
+            "-i",
+            str(image_path),
+            "-f",
+            "null",
+            "-",
+        ],
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def generate_video_thumbnail(
+    ffmpeg_bin: str,
+    media_path: Path,
+    video_index: int,
+    temp_dir: Path,
+) -> tuple[Path, str]:
+    output_path = temp_dir / "generated-thumbnail.webp"
+    attempts = [(GENERATED_THUMBNAIL_TIMESTAMP, "generated:20s"), ("0", "generated:first-frame")]
+    last_attempt: subprocess.CompletedProcess[str] | None = None
+
+    for timestamp, source_label in attempts:
+        last_attempt = _capture_video_frame(ffmpeg_bin, media_path, video_index, timestamp, output_path)
+        if last_attempt.returncode == 0 and _is_decodable_image(ffmpeg_bin, output_path):
+            return output_path, source_label
+
+    if last_attempt is not None and last_attempt.returncode != 0:
+        last_attempt.check_returncode()
+    raise ConversionError("ffmpeg did not produce a thumbnail frame")
 
 
 def ffmpeg_supports_encoder(ffmpeg_bin: str, encoder_name: str) -> bool:
@@ -253,7 +329,10 @@ def choose_cover(
             ),
             "embedded",
         )
-    return None, "none"
+
+    if metadata.video_index is None:
+        raise ConversionError("no primary video stream found")
+    return generate_video_thumbnail(ffmpeg_bin, job.source_video, metadata.video_index, temp_dir)
 
 
 def cover_output_path_for_job(job: Job) -> Path:
