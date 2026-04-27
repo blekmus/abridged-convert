@@ -26,6 +26,8 @@ class Job:
     source_video: Path
     output_file: Path
     external_cover: Path | None = None
+    cover_search_dir: Path | None = None
+    cover_match_source: Path | None = None
 
 
 @dataclass

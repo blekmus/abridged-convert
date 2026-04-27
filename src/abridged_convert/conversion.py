@@ -12,7 +12,7 @@ from abridged_convert.media import (
     choose_cover,
     collect_metadata,
     cover_output_path_for_job,
-    resolve_video_encoding_config,
+    cpu_video_encoding_config,
     run_command,
     write_cover_sidecar,
 )
@@ -109,7 +109,7 @@ def convert_job(
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
             if encoding.mode == "nvidia" and any(marker in stderr.lower() for marker in GPU_ERROR_MARKERS):
-                fallback_encoding = resolve_video_encoding_config(ffmpeg_bin, "cpu")
+                fallback_encoding = cpu_video_encoding_config()
                 ffmpeg_cmd = build_ffmpeg_command(
                     ffmpeg_bin,
                     job.source_video,
@@ -134,7 +134,7 @@ def convert_job(
                     raise
                 result.success = True
                 result.message = (
-                    "resumed after interruption; fell back to cpu after gpu failure)"
+                    "resumed after interruption; fell back to cpu after gpu failure"
                     if resumed_from_incomplete
                     else "converted (fell back to cpu after gpu failure)"
                 )
@@ -153,5 +153,6 @@ def convert_job(
                 tracking_file.unlink(missing_ok=True)
 
     result.success = True
-    result.message = "resumed after interruption" if resumed_from_incomplete else "converted"
+    action = "remuxed" if encoding.mode == "copy" else "converted"
+    result.message = f"resumed after interruption; {action}" if resumed_from_incomplete else action
     return result

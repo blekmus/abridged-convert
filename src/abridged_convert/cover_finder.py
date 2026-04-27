@@ -116,6 +116,11 @@ def normalize_text(value: str) -> str:
     normalized = re.sub(r"[“”＂]", '"', normalized)
     normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = re.sub(
+        r"(?<![a-z])(?:[a-z]\s+){2,}[a-z](?![a-z])",
+        lambda match: match.group(0).replace(" ", ""),
+        normalized,
+    )
     return normalized
 
 
@@ -332,7 +337,7 @@ def token_overlap(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / min(len(left_tokens), len(right_tokens))
 
 
-def smart_title_score(source_stem: str, candidate_stem: str) -> float:
+def smart_title_score(source_stem: str, candidate_stem: str, *, allow_title_containment: bool = False) -> float:
     source_title = extract_title(source_stem)
     candidate_title = extract_title(candidate_stem)
     if not source_title or not candidate_title:
@@ -341,11 +346,17 @@ def smart_title_score(source_stem: str, candidate_stem: str) -> float:
     if source_title == candidate_title:
         return 1.0
 
+    source_tokens = set(source_title.split())
+    candidate_tokens = set(candidate_title.split())
+    containment_score = 0.0
+    if allow_title_containment and source_tokens and source_tokens <= candidate_tokens:
+        containment_score = 0.82
+
     lev_dice = (normalized_levenshtein(source_title, candidate_title) + sorensen_dice(source_title, candidate_title)) / 2.0
     jaro = jaro_winkler(source_title, candidate_title)
     overlap = token_overlap(source_title, candidate_title)
     jaccard = token_jaccard(source_title, candidate_title)
-    return min(1.0, (0.45 * lev_dice) + (0.25 * jaro) + (0.20 * overlap) + (0.10 * jaccard))
+    return min(1.0, max(containment_score, (0.45 * lev_dice) + (0.25 * jaro) + (0.20 * overlap) + (0.10 * jaccard)))
 
 
 def _sortable_reference(value: str) -> tuple[int, float]:
@@ -397,6 +408,8 @@ def evaluate_candidates(
     source_video: Path,
     covers_dir: Path,
     metadata_title: str | None = None,
+    *,
+    allow_title_containment: bool = False,
 ) -> list[CoverCandidateMatch]:
     if not covers_dir.is_dir():
         return []
@@ -425,7 +438,11 @@ def evaluate_candidates(
         exact_episode_match = bool(source_episode and source_episode in candidate_refs)
         reference_overlap = (len(shared_refs) / len(source_refs)) if source_refs else 0.0
 
-        title_similarity = smart_title_score(source_video.stem, candidate.stem)
+        title_similarity = smart_title_score(
+            source_video.stem,
+            candidate.stem,
+            allow_title_containment=allow_title_containment,
+        )
         full_similarity = (
             (normalized_levenshtein(source_full, candidate_full) + sorensen_dice(source_full, candidate_full)) / 2.0
             if source_full and candidate_full
@@ -516,8 +533,14 @@ def find_best_cover(
     *,
     metadata_title: str | None = None,
     minimum_score: float = MINIMUM_HYBRID_COVER_SCORE,
+    allow_title_containment: bool = False,
 ) -> CoverCandidateMatch | None:
-    results = evaluate_candidates(source_video, covers_dir, metadata_title)
+    results = evaluate_candidates(
+        source_video,
+        covers_dir,
+        metadata_title,
+        allow_title_containment=allow_title_containment,
+    )
     if not results:
         return None
     best = results[0]

@@ -11,6 +11,10 @@ from abridged_convert.discovery import derived_output_title, parse_entry_name
 from abridged_convert.models import ConversionError, ConversionResult, EntryMetadata, Job, VideoEncodingConfig
 
 GENERATED_THUMBNAIL_TIMESTAMP = "20"
+WEBM_AUDIO_CODECS = {"opus", "vorbis"}
+WEBM_VIDEO_CODECS = {"av1", "vp8", "vp9"}
+MP4_AUDIO_CODECS = {"aac", "ac3", "alac", "eac3", "mp3"}
+MP4_VIDEO_CODECS = {"av1", "h264", "hevc", "mpeg4", "vp9"}
 
 
 def run_command(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -90,6 +94,46 @@ def collect_metadata(ffprobe_bin: str, media_path: Path) -> EntryMetadata:
             metadata.tags["comment"] = purl
 
     return metadata
+
+
+def primary_av_codecs(probe: dict) -> tuple[str | None, str | None]:
+    video_codec: str | None = None
+    audio_codec: str | None = None
+
+    for stream in probe.get("streams", []):
+        stream_type = stream.get("codec_type")
+        codec_name = stream.get("codec_name")
+        disposition = stream.get("disposition") or {}
+
+        if stream_type == "video":
+            is_attached_pic = bool(disposition.get("attached_pic"))
+            looks_like_cover = codec_name in IMAGE_CODECS and video_codec is not None
+            if is_attached_pic or looks_like_cover:
+                continue
+            if video_codec is None:
+                video_codec = codec_name
+        elif stream_type == "audio" and audio_codec is None:
+            audio_codec = codec_name
+
+    return video_codec, audio_codec
+
+
+def is_webm_compatible(video_codec: str | None, audio_codec: str | None) -> bool:
+    return video_codec in WEBM_VIDEO_CODECS and (audio_codec is None or audio_codec in WEBM_AUDIO_CODECS)
+
+
+def is_mp4_compatible(video_codec: str | None, audio_codec: str | None) -> bool:
+    return video_codec in MP4_VIDEO_CODECS and (audio_codec is None or audio_codec in MP4_AUDIO_CODECS)
+
+
+def resolve_remux_output_suffix(ffprobe_bin: str, media_path: Path) -> str | None:
+    video_codec, audio_codec = primary_av_codecs(ffprobe_json(ffprobe_bin, media_path))
+
+    if is_webm_compatible(video_codec, audio_codec):
+        return ".webm"
+    if is_mp4_compatible(video_codec, audio_codec):
+        return ".mp4"
+    return None
 
 
 def apply_output_metadata_overrides(job: Job, metadata: EntryMetadata) -> None:
@@ -214,26 +258,33 @@ def ffmpeg_supports_encoder(ffmpeg_bin: str, encoder_name: str) -> bool:
     return encoder_name in completed.stdout
 
 
-def resolve_video_encoding_config(ffmpeg_bin: str, mode: str) -> VideoEncodingConfig:
-    if mode == "cpu":
-        return VideoEncodingConfig(mode="cpu", codec="libx264", extra_args=("-preset", "medium", "-crf", "23"))
+def copy_video_encoding_config() -> VideoEncodingConfig:
+    return VideoEncodingConfig(mode="copy", codec="copy", extra_args=())
 
-    if mode == "nvidia":
-        if not ffmpeg_supports_encoder(ffmpeg_bin, "h264_nvenc"):
-            raise ConversionError("ffmpeg does not support h264_nvenc on this system")
-        return VideoEncodingConfig(
-            mode="nvidia",
-            codec="h264_nvenc",
-            extra_args=("-preset", "p5", "-cq", "23", "-rc", "vbr"),
-        )
 
-    if ffmpeg_supports_encoder(ffmpeg_bin, "h264_nvenc"):
-        return VideoEncodingConfig(
-            mode="nvidia",
-            codec="h264_nvenc",
-            extra_args=("-preset", "p5", "-cq", "23", "-rc", "vbr"),
-        )
+def cpu_video_encoding_config() -> VideoEncodingConfig:
     return VideoEncodingConfig(mode="cpu", codec="libx264", extra_args=("-preset", "medium", "-crf", "23"))
+
+
+def nvidia_video_encoding_config() -> VideoEncodingConfig:
+    return VideoEncodingConfig(
+        mode="nvidia",
+        codec="h264_nvenc",
+        extra_args=("-preset", "p5", "-cq", "23", "-rc", "vbr"),
+    )
+
+
+def preferred_video_encoding_config(ffmpeg_bin: str) -> VideoEncodingConfig:
+    if ffmpeg_supports_encoder(ffmpeg_bin, "h264_nvenc"):
+        return nvidia_video_encoding_config()
+    return cpu_video_encoding_config()
+
+
+def resolve_video_handling_plan(ffprobe_bin: str, ffmpeg_bin: str, media_path: Path) -> tuple[str, VideoEncodingConfig]:
+    remux_suffix = resolve_remux_output_suffix(ffprobe_bin, media_path)
+    if remux_suffix is not None:
+        return remux_suffix, copy_video_encoding_config()
+    return ".mp4", preferred_video_encoding_config(ffmpeg_bin)
 
 
 def build_ffmpeg_command(
@@ -245,47 +296,21 @@ def build_ffmpeg_command(
     encoding: VideoEncodingConfig,
 ) -> list[str]:
     cmd = [ffmpeg_bin, "-y", "-v", "error", "-i", str(source_video)]
-    if cover_path is not None:
-        cmd.extend(["-i", str(cover_path)])
 
     cmd.extend(["-map", f"0:{metadata.video_index}"])
     if metadata.audio_index is not None:
         cmd.extend(["-map", f"0:{metadata.audio_index}"])
-    if cover_path is not None:
-        cmd.extend(["-map", "1:v:0"])
 
-    cmd.extend(
-        [
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-sn",
-            "-dn",
-            "-c:v:0",
-            encoding.codec,
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    )
-    cmd.extend(encoding.extra_args)
+    cmd.extend(["-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn", "-c:v:0", encoding.codec])
+    if encoding.mode != "copy":
+        cmd.extend(["-pix_fmt", "yuv420p"])
+        cmd.extend(encoding.extra_args)
 
     if metadata.audio_index is not None:
-        cmd.extend(["-c:a:0", "aac", "-b:a:0", "160k"])
-
-    if cover_path is not None:
-        cmd.extend(
-            [
-                "-c:v:1",
-                "png",
-                "-disposition:v:1",
-                "attached_pic",
-                "-metadata:s:v:1",
-                "title=Cover",
-                "-metadata:s:v:1",
-                "comment=Cover (front)",
-            ]
-        )
+        if encoding.mode == "copy":
+            cmd.extend(["-c:a:0", "copy"])
+        else:
+            cmd.extend(["-c:a:0", "aac", "-b:a:0", "160k"])
 
     if metadata.video_language:
         cmd.extend(["-metadata:s:v:0", f"language={metadata.video_language}"])
@@ -296,7 +321,9 @@ def build_ffmpeg_command(
         if value:
             cmd.extend(["-metadata", f"{key}={value}"])
 
-    cmd.extend(["-movflags", "+faststart", str(output_path)])
+    if output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+        cmd.extend(["-movflags", "+faststart"])
+    cmd.append(str(output_path))
     return cmd
 
 
@@ -308,6 +335,17 @@ def choose_cover(
 ) -> tuple[Path | None, str]:
     if job.external_cover is not None:
         return job.external_cover, f"external:{job.external_cover.name}"
+
+    if job.cover_search_dir is not None:
+        cover_match = find_best_cover(
+            job.cover_match_source or job.source_video,
+            job.cover_search_dir,
+            metadata_title=metadata.tags.get("title"),
+            minimum_score=0.5,
+            allow_title_containment=True,
+        )
+        if cover_match is not None:
+            return cover_match.path, f"external:{cover_match.path.name}"
 
     if job.category == "Series":
         cover_match = find_best_cover(

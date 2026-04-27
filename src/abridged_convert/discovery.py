@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
+from abridged_convert.common import normalize_categories
 from abridged_convert.constants import CATEGORY_ORDER, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from abridged_convert.models import ConversionError, ConversionResult, Job
 
@@ -48,7 +49,8 @@ def discover_repo_root(start: Path | None = None) -> Path:
         seen.add(root)
         if any((root / category).is_dir() for category in CATEGORY_ORDER):
             return root
-    raise ConversionError("could not locate repo root containing Shots, Shorts, or Series")
+    expected = ", ".join(CATEGORY_ORDER)
+    raise ConversionError(f"could not locate repo root containing {expected}")
 
 
 def resolve_input_roots(
@@ -136,33 +138,60 @@ def derived_output_title(job: Job) -> str:
     return entry_title
 
 
+def discover_single_item_job(category: str, entry_dir: Path, output_file: Path) -> Job | ConversionResult:
+    try:
+        source_video = find_primary_video(entry_dir)
+    except ConversionError as exc:
+        return discovery_failure(
+            category,
+            entry_dir,
+            output_file,
+            str(exc),
+        )
+
+    return Job(
+        category=category,
+        entry_dir=entry_dir,
+        source_video=source_video,
+        output_file=output_file,
+        external_cover=find_external_cover(entry_dir),
+    )
+
+
+def discover_amv_jobs(amv_root: Path, output_root: Path) -> list[Job]:
+    covers_dir = amv_root / "covers"
+    jobs: list[Job] = []
+    for child in sorted(amv_root.iterdir()):
+        if child.is_dir() or child.suffix.lower() != ".mkv":
+            continue
+        _, title = parse_entry_name(child.stem)
+        jobs.append(
+            Job(
+                category="Songs",
+                entry_dir=amv_root / child.stem,
+                source_video=child,
+                output_file=output_root / "AMV" / child.stem / "1.mp4",
+                cover_search_dir=covers_dir,
+                cover_match_source=child.with_name(f"{title}{child.suffix}"),
+            )
+        )
+    return jobs
+
+
 def discover_jobs_for_root(category: str, input_root: Path, output_root: Path) -> tuple[list[Job], list[ConversionResult]]:
     jobs: list[Job] = []
     failures: list[ConversionResult] = []
     for entry_dir in find_top_level_dirs(input_root):
-        if category in {"Shots", "Shorts"}:
-            try:
-                source_video = find_primary_video(entry_dir)
-            except ConversionError as exc:
-                failures.append(
-                    discovery_failure(
-                        category,
-                        entry_dir,
-                        output_root / entry_dir.name / "1.mp4",
-                        str(exc),
-                    )
-                )
+        if category in {"Shots", "Shorts", "Songs"}:
+            if category == "Songs" and entry_dir.name == "[~] AMVs":
+                jobs.extend(discover_amv_jobs(entry_dir, output_root))
                 continue
 
-            jobs.append(
-                Job(
-                    category=category,
-                    entry_dir=entry_dir,
-                    source_video=source_video,
-                    output_file=output_root / entry_dir.name / "1.mp4",
-                    external_cover=find_external_cover(entry_dir),
-                )
-            )
+            discovered = discover_single_item_job(category, entry_dir, output_root / entry_dir.name / "1.mp4")
+            if isinstance(discovered, ConversionResult):
+                failures.append(discovered)
+            else:
+                jobs.append(discovered)
             continue
 
         for child in sorted(entry_dir.iterdir()):
@@ -201,14 +230,3 @@ def discover_jobs(
         failures.extend(category_failures)
     return jobs, failures
 
-
-def normalize_categories(values: Iterable[str]) -> list[str]:
-    normalized: list[str] = []
-    valid = {category.lower(): category for category in CATEGORY_ORDER}
-    for value in values:
-        category = valid.get(value.lower())
-        if category is None:
-            raise ConversionError(f"unknown category: {value}")
-        if category not in normalized:
-            normalized.append(category)
-    return normalized

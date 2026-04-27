@@ -12,7 +12,7 @@ PREFERRED_TAG_ORDER = (
     "comment",
     "synopsis",
 )
-CATEGORY_ORDER = ("Series", "Shots", "Shorts")
+CATEGORY_ORDER = ("Series", "Shots", "Shorts", "Songs")
 GPU_ERROR_MARKERS = (
     "cannot load libcuda",
     "cannot init cuda",

@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import TextIO
+from typing import Iterable, TextIO
 
 from abridged_convert.discovery import compact_label, relative_label
 from abridged_convert.models import ConversionResult, Job, JobState, VideoEncodingConfig
@@ -28,7 +28,11 @@ def summarize_result(result: ConversionResult, repo_root: Path) -> str:
     return " | ".join(details)
 
 
-def encoding_label(encoding: VideoEncodingConfig) -> str:
+def encoding_label(encoding: VideoEncodingConfig | None) -> str:
+    if encoding is None:
+        return "Auto remux / encode"
+    if encoding.mode == "copy":
+        return "Stream copy / remux"
     return "GPU / NVIDIA NVENC" if encoding.mode == "nvidia" else "CPU / libx264"
 
 
@@ -63,7 +67,7 @@ class TerminalUI:
         *,
         repo_root: Path,
         categories: list[str],
-        encoding: VideoEncodingConfig,
+        encoding: VideoEncodingConfig | None,
         jobs: list[Job],
         discovery_failures: list[ConversionResult],
         persist_final_report: bool,
@@ -116,6 +120,7 @@ class TerminalUI:
             return
         self.render()
         self.close()
+        self._print_processed_report()
         if self.persist_final_report:
             self._print_persistent_report(exit_code)
 
@@ -168,11 +173,20 @@ class TerminalUI:
         self.current_detail = state.label
         self.render()
 
-    def set_final_summary(self, *, converted: int, skipped: int, failed: int) -> None:
-        self.final_message = f"converted={converted} skipped={skipped} failed={failed}"
+    def set_final_summary(self, *, converted: int, skipped: int, failed: int, pruned: int = 0) -> None:
+        self.final_message = f"converted={converted} skipped={skipped} failed={failed} pruned={pruned}"
         self.completed = converted
         self.skipped = skipped
         self.failed = failed
+        self.render()
+
+    def add_pruned_items(self, cache_keys: Iterable[str]) -> None:
+        for cache_key in cache_keys:
+            self.states.append(JobState(label=cache_key, detail="pruned", status="pruned"))
+            if not self.enabled:
+                self.stream.write(f"Pruned: {cache_key}\n")
+        if not self.enabled:
+            self.stream.flush()
         self.render()
 
     def print_result_line(self, result: ConversionResult) -> None:
@@ -200,6 +214,7 @@ class TerminalUI:
                 ]
             ),
             f"{self.ANSI_BRIGHT_BLACK}root{self.ANSI_RESET} {self.repo_root}",
+            f"{self.ANSI_BRIGHT_BLACK}phase{self.ANSI_RESET} {self.phase}: {self.current_detail}",
             "",
             f"{self.ANSI_BOLD}Queue{self.ANSI_RESET}",
             *self._queue_lines(),
@@ -236,6 +251,9 @@ class TerminalUI:
         if state.status == "failed":
             suffix = f" {self.ANSI_DIM}{state.detail}{self.ANSI_RESET}" if state.detail else ""
             return f"{self._status_badge('✗', 'failed', self.ANSI_RED)} {label}{suffix}"
+        if state.status == "pruned":
+            suffix = f" {self.ANSI_DIM}{state.detail}{self.ANSI_RESET}" if state.detail else ""
+            return f"{self._status_badge('-', 'pruned', self.ANSI_YELLOW)} {label}{suffix}"
         return ""
 
     def _state_for_job(self, job: Job) -> JobState:
@@ -272,6 +290,8 @@ class TerminalUI:
             return "SKIP"
         if state.status == "failed":
             return "FAIL"
+        if state.status == "pruned":
+            return "PRUNE"
         return "PEND"
 
     def _plain_state_line(self, state: JobState) -> str:
@@ -281,6 +301,19 @@ class TerminalUI:
         if state.message:
             details.append(state.message)
         return " | ".join(details)
+
+    def _print_processed_report(self) -> None:
+        processed_states = [state for state in self.states if state.status in {"done", "failed", "pruned"}]
+        if not processed_states:
+            return
+
+        lines = [
+            f"{self.ANSI_BOLD}Processed{self.ANSI_RESET}",
+            *(self._format_state_line(state) for state in processed_states),
+            "",
+        ]
+        self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
 
     def _print_persistent_report(self, exit_code: int) -> None:
         lines = [
