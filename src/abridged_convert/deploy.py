@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
@@ -12,8 +13,14 @@ from abridged_convert.common import normalize_categories, path_is_in_categories,
 from abridged_convert.constants import CATEGORY_ORDER
 from abridged_convert.media import cover_output_path_for_job
 from abridged_convert.metadata import (
+    DEPLOY_RUN_SIGNATURE_KEY,
+    DEPLOY_RUN_STATUS_IN_PROGRESS,
+    DEPLOY_RUN_STATUS_KEY,
+    ITEM_UPLOAD_PENDING_KEY,
     METADATA_CACHE_FILENAME,
     build_metadata_cache_item,
+    deploy_state_from_metadata_item,
+    load_cache_document,
     load_cache_deploy_items,
     load_cache_items,
     write_cache,
@@ -47,6 +54,9 @@ class DeployContext:
     remote_files: set[str]
     plans: list[DeployJobPlan]
     prune_categories: tuple[str, ...]
+    deploy_run_signature: str
+    resumed: bool
+    dangling_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,6 +74,7 @@ def bootstrap_deploy_from_existing_outputs(
     rclone_bin: str,
     remote_root: str | None,
     input_root: Path,
+    source_signature_root: Path | None = None,
     staging_root: Path,
     jobs: list[Job],
     prune_categories: Iterable[str],
@@ -73,6 +84,7 @@ def bootstrap_deploy_from_existing_outputs(
     log: DeployLogger | None = None,
 ) -> DeploySummary:
     resolved_staging = staging_root.resolve()
+    resolved_source_signature_root = (source_signature_root or input_root).resolve()
     if not resolved_staging.is_dir():
         raise ConversionError(f"bootstrap output directory does not exist: {staging_root}")
     emit(log, f"bootstrap using existing outputs in {resolved_staging}")
@@ -84,7 +96,7 @@ def bootstrap_deploy_from_existing_outputs(
             job=job,
             output_key=relative_output_key(resolved_staging, job.output_file),
             cover_key=relative_output_key(resolved_staging, cover_output_path_for_job(job)),
-            source_signature=source_signature(input_root, job.source_video),
+            source_signature=source_signature(resolved_source_signature_root, job.source_video),
             changed=True,
             needs_conversion=False,
             reason="bootstrap",
@@ -130,10 +142,10 @@ def bootstrap_deploy_from_existing_outputs(
 
     dangling = sorted(dangling_remote_files(remote_files, expected_files, prune_scope))
     if dry_run:
-        emit(log, f"dry run: would upload {len(uploaded_paths) + (1 if remote_root else 0)} file(s)")
-        emit(log, f"dry run: would delete {len(dangling)} dangling remote file(s)")
+        dry_run_uploads = uploaded_paths + ([METADATA_CACHE_FILENAME] if remote_root else [])
+        log_dry_run_remote_actions(log, uploads=dry_run_uploads, deletes=dangling)
         return DeploySummary(
-            uploaded=len(uploaded_paths) + (1 if remote_root else 0),
+            uploaded=len(dry_run_uploads),
             deleted=len(dangling),
             skipped=0,
             changed=len(plans),
@@ -147,7 +159,7 @@ def bootstrap_deploy_from_existing_outputs(
     if safe_remote_root is not None:
         uploaded_paths.append(METADATA_CACHE_FILENAME)
         upload_remote_files(rclone_bin, safe_remote_root, resolved_staging, uploaded_paths, log=log)
-        delete_remote_files(rclone_bin, safe_remote_root, dangling, log=log)
+        delete_remote_files(rclone_bin, safe_remote_root, dangling, remote_files=remote_files, log=log)
         if not keep_staging:
             emit(log, f"cleaning staging directory: {resolved_staging}")
             clean_staging(resolved_staging, input_root=input_root)
@@ -169,6 +181,7 @@ def prepare_deploy_context(
     rclone_bin: str,
     remote_root: str,
     input_root: Path,
+    source_signature_root: Path | None = None,
     staging_root: Path,
     jobs: list[Job],
     prune_categories: Iterable[str],
@@ -178,39 +191,59 @@ def prepare_deploy_context(
     resolved_staging = staging_root.resolve()
     resolved_staging.mkdir(parents=True, exist_ok=True)
     safe_remote_root = validate_remote_root(remote_root)
-    staged_metadata_items = load_cache_items(resolved_staging / METADATA_CACHE_FILENAME)
-    staged_state_items = load_cache_deploy_items(resolved_staging / METADATA_CACHE_FILENAME)
-
     emit(log, f"preparing staging directory: {resolved_staging}")
-    emit(log, f"listing remote files: {safe_remote_root}")
-    remote_files = list_remote_files(rclone_bin, safe_remote_root)
-    emit(log, f"remote has {len(remote_files)} file(s)")
     metadata_path = resolved_staging / METADATA_CACHE_FILENAME
     state_path = metadata_path
+    local_cache = load_cache_document(metadata_path)
+    local_signature = local_cache.get(DEPLOY_RUN_SIGNATURE_KEY)
+    resumed = (
+        local_cache.get(DEPLOY_RUN_STATUS_KEY) == DEPLOY_RUN_STATUS_IN_PROGRESS
+        and isinstance(local_signature, str)
+        and bool(local_signature.strip())
+    )
 
-    if METADATA_CACHE_FILENAME in remote_files:
+    if resumed:
+        deploy_run_signature = local_signature
+        emit(log, f"resuming deploy run: {deploy_run_signature}")
+    else:
+        deploy_run_signature = uuid.uuid4().hex
         emit(log, f"downloading {METADATA_CACHE_FILENAME}")
-        download_remote_file(
+        downloaded = download_remote_file_if_exists(
             rclone_bin,
             safe_remote_root,
             METADATA_CACHE_FILENAME,
             metadata_path,
         )
-    else:
-        emit(log, f"initializing missing {METADATA_CACHE_FILENAME}")
-        write_cache(metadata_path, {})
+        if not downloaded:
+            emit(log, f"initializing missing {METADATA_CACHE_FILENAME}")
+        remote_items = load_cache_items(metadata_path) if downloaded else {}
+        write_deploy_journal(
+            metadata_path,
+            remote_items,
+            deploy_run_signature=deploy_run_signature,
+            metadata_upload_pending=False,
+        )
 
     metadata_items = load_cache_items(metadata_path)
     state_items = load_cache_deploy_items(metadata_path)
+    staged_metadata_items = metadata_items
+    staged_state_items = state_items
+    dangling_paths = dangling_paths_from_metadata(
+        metadata_items,
+        jobs=jobs,
+        source_signature_root=source_signature_root or input_root,
+        prune_categories=normalize_categories(prune_categories),
+    )
     plans = build_deploy_plans(
         input_root=input_root,
+        source_signature_root=source_signature_root or input_root,
         staging_root=resolved_staging,
         jobs=jobs,
         metadata_items=metadata_items,
         state_items=state_items,
         staged_metadata_items=staged_metadata_items,
         staged_state_items=staged_state_items,
-        remote_files=remote_files,
+        remote_files=set(),
         force=force,
     )
     changed = sum(1 for plan in plans if plan.changed)
@@ -224,15 +257,19 @@ def prepare_deploy_context(
         state_path=state_path,
         metadata_items=metadata_items,
         state_items=state_items,
-        remote_files=remote_files,
+        remote_files=set(),
         plans=plans,
         prune_categories=normalize_categories(prune_categories),
+        deploy_run_signature=deploy_run_signature,
+        resumed=resumed,
+        dangling_paths=dangling_paths,
     )
 
 
 def build_deploy_plans(
     *,
     input_root: Path,
+    source_signature_root: Path | None = None,
     staging_root: Path,
     jobs: list[Job],
     metadata_items: dict[str, dict[str, Any]],
@@ -243,14 +280,23 @@ def build_deploy_plans(
     force: bool,
 ) -> list[DeployJobPlan]:
     plans: list[DeployJobPlan] = []
+    signature_root = source_signature_root or input_root
+    metadata_by_source = metadata_items_by_source(metadata_items)
     for job in jobs:
-        output_key = relative_output_key(staging_root, job.output_file)
-        cover_key = relative_output_key(staging_root, cover_output_path_for_job(job))
-        signature = source_signature(input_root, job.source_video)
+        signature = source_signature(signature_root, job.source_video)
+        matched_key, matched_item = matching_metadata_item(metadata_by_source, signature)
+        if matched_item is not None:
+            output_key = metadata_output_key(matched_key, matched_item)
+            cover_key = metadata_cover_key(output_key, matched_item)
+            job = replace_job_output(job, staging_root / Path(output_key))
+        else:
+            output_key = relative_output_key(staging_root, job.output_file)
+            cover_key = relative_output_key(staging_root, cover_output_path_for_job(job))
         existing_state = state_items.get(output_key)
         staged_item = staged_metadata_items.get(output_key)
         staged_state = staged_state_items.get(output_key)
         staged_ready = staged_output_is_ready(job, output_key, cover_key, signature, staged_item, staged_state)
+        pending_upload = matched_item is not None and matched_item.get(ITEM_UPLOAD_PENDING_KEY) is False
 
         reason = "remote unchanged"
         changed = False
@@ -259,6 +305,14 @@ def build_deploy_plans(
             changed = True
             needs_conversion = True
             reason = "overwrite requested"
+        elif pending_upload:
+            changed = True
+            needs_conversion = not pending_output_files_ready(job)
+            reason = "pending upload" if not needs_conversion else "pending output missing"
+        elif matched_item is not None:
+            changed = False
+            needs_conversion = False
+            reason = "remote metadata match"
         elif existing_state is None:
             changed = True
             needs_conversion = not staged_ready
@@ -275,10 +329,6 @@ def build_deploy_plans(
             changed = True
             needs_conversion = not staged_ready
             reason = "staged output ready" if staged_ready else "metadata missing"
-        elif output_key not in remote_files or cover_key not in remote_files:
-            changed = True
-            needs_conversion = not staged_ready
-            reason = "staged output ready" if staged_ready else "remote file missing"
 
         plans.append(
             DeployJobPlan(
@@ -295,6 +345,83 @@ def build_deploy_plans(
     return plans
 
 
+def replace_job_output(job: Job, output_file: Path) -> Job:
+    return replace(job, output_file=output_file)
+
+
+def metadata_items_by_source(items: dict[str, dict[str, Any]]) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    indexed: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for key, item in items.items():
+        source = item.get("source")
+        if not isinstance(source, dict):
+            continue
+        source_path = source.get("path")
+        if isinstance(source_path, str):
+            indexed.setdefault(source_path, []).append((key, item))
+    return indexed
+
+
+def matching_metadata_item(
+    items_by_source: dict[str, list[tuple[str, dict[str, Any]]]],
+    signature: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    source_path = signature.get("path")
+    source_size = signature.get("size")
+    if not isinstance(source_path, str):
+        return None, None
+    for key, item in items_by_source.get(source_path, []):
+        source = item.get("source")
+        if isinstance(source, dict) and source.get("size") == source_size:
+            return key, item
+    return None, None
+
+
+def metadata_output_key(metadata_key: str | None, item: dict[str, Any]) -> str:
+    output_path = item.get("outputPath")
+    if isinstance(output_path, str):
+        return validate_remote_relpath(output_path)
+    if metadata_key is None:
+        raise ConversionError("metadata item is missing output path")
+    return validate_remote_relpath(metadata_key)
+
+
+def metadata_cover_key(output_key: str, item: dict[str, Any]) -> str:
+    cover_path = item.get("coverPath")
+    if isinstance(cover_path, str):
+        return validate_remote_relpath(cover_path)
+    return validate_remote_relpath(Path(output_key).with_suffix(".webp").as_posix())
+
+
+def dangling_paths_from_metadata(
+    metadata_items: dict[str, dict[str, Any]],
+    *,
+    jobs: list[Job],
+    source_signature_root: Path,
+    prune_categories: Iterable[str],
+) -> tuple[str, ...]:
+    local_sources = {
+        (signature["path"], signature["size"])
+        for signature in (source_signature(source_signature_root, job.source_video) for job in jobs)
+    }
+    selected_categories = normalize_categories(prune_categories)
+    dangling: set[str] = set()
+    for key, item in metadata_items.items():
+        if not path_is_in_categories(key, selected_categories):
+            continue
+        source = item.get("source")
+        if not isinstance(source, dict):
+            continue
+        source_path = source.get("path")
+        source_size = source.get("size")
+        if (source_path, source_size) in local_sources:
+            continue
+        output_key = metadata_output_key(key, item)
+        cover_key = metadata_cover_key(output_key, item)
+        dangling.add(output_key)
+        dangling.add(cover_key)
+    return tuple(sorted(dangling))
+
+
 def finalize_deploy(
     *,
     rclone_bin: str,
@@ -306,25 +433,29 @@ def finalize_deploy(
     input_root: Path,
     log: DeployLogger | None = None,
 ) -> DeploySummary:
-    expected_files = expected_remote_files(context.plans)
     next_metadata_items: dict[str, dict[str, Any]] = {
         key: item
         for key, item in context.metadata_items.items()
         if not path_is_in_categories(key, context.prune_categories)
     }
-    next_deploy_items: dict[str, dict[str, Any]] = {}
     uploaded_paths: list[str] = []
 
     now = datetime.now(tz=UTC).isoformat()
     emit(log, "building next metadata and deploy tracking")
     changed_plans = [plan for plan in context.plans if plan.changed]
+    metadata_changed = bool(changed_plans or context.dangling_paths or context.resumed)
     if dry_run:
-        dangling = dangling_remote_files(context.remote_files, expected_files, context.prune_categories)
-        emit(log, f"dry run: would upload {len(changed_plans) * 2 + 1} file(s)")
-        emit(log, f"dry run: would delete {len(dangling)} dangling remote file(s)")
+        upload_paths = [
+            relpath
+            for plan in changed_plans
+            for relpath in (plan.output_key, plan.cover_key)
+        ]
+        if metadata_changed:
+            upload_paths.append(METADATA_CACHE_FILENAME)
+        log_dry_run_remote_actions(log, uploads=upload_paths, deletes=list(context.dangling_paths))
         return DeploySummary(
-            uploaded=len(changed_plans) * 2 + 1,
-            deleted=len(dangling),
+            uploaded=len(upload_paths),
+            deleted=len(context.dangling_paths),
             skipped=sum(1 for plan in context.plans if not plan.changed),
             changed=sum(1 for plan in context.plans if plan.changed),
             metadata_path=context.metadata_path,
@@ -334,41 +465,60 @@ def finalize_deploy(
     for index, plan in enumerate(context.plans, start=1):
         deploy_item = deploy_tracking_item(plan, deployed_at=now)
         if plan.changed:
-            if plan.output_key not in successful_output_keys:
-                raise ConversionError(f"deploy output was not converted successfully: {plan.output_key}")
-            if plan.needs_conversion:
-                emit(log, f"probing changed output {len(uploaded_paths) // 2 + 1}/{len(changed_plans)}: {plan.output_key}")
-                item = build_metadata_cache_item(
-                    plan.job.output_file,
-                    ffprobe_bin=ffprobe_bin,
-                    deploy_item=deploy_item,
+            item = context.metadata_items.get(plan.output_key)
+            if item is None:
+                raise ConversionError(f"deploy metadata is missing changed output: {plan.output_key}")
+            if item.get(ITEM_UPLOAD_PENDING_KEY) is False:
+                emit(log, f"uploading pending item {len(uploaded_paths) // 2 + 1}/{len(changed_plans)}: {plan.output_key}")
+                upload_remote_files(rclone_bin, context.remote_root, context.staging_root, [plan.output_key, plan.cover_key], log=log)
+                uploaded_paths.extend([plan.output_key, plan.cover_key])
+                item.pop(ITEM_UPLOAD_PENDING_KEY, None)
+                context.metadata_items[plan.output_key] = item
+                write_deploy_journal(
+                    context.metadata_path,
+                    context.metadata_items,
+                    deploy_run_signature=context.deploy_run_signature,
+                    metadata_upload_pending=True,
                 )
-                if item is None:
-                    raise ConversionError(f"failed to probe metadata for staged output: {plan.job.output_file}")
-                next_metadata_items[plan.output_key] = item
-            else:
-                if plan.staged_metadata_item is None:
-                    raise ConversionError(f"staged metadata is missing for deploy output: {plan.output_key}")
-                emit(log, f"reusing staged metadata {index}/{len(context.plans)}: {plan.output_key}")
-                next_metadata_items[plan.output_key] = plan.staged_metadata_item
-            uploaded_paths.extend([plan.output_key, plan.cover_key])
+            item = dict(item)
+            item.pop(ITEM_UPLOAD_PENDING_KEY, None)
+            next_metadata_items[plan.output_key] = item
         else:
             existing_item = context.metadata_items.get(plan.output_key)
             if existing_item is None:
                 raise ConversionError(f"remote metadata is missing unchanged output: {plan.output_key}")
             emit(log, f"reusing metadata {index}/{len(context.plans)}: {plan.output_key}")
-            next_metadata_items[plan.output_key] = existing_item
+            item = dict(existing_item)
+            item.pop(ITEM_UPLOAD_PENDING_KEY, None)
+            next_metadata_items[plan.output_key] = item
 
-        next_deploy_items[plan.output_key] = deploy_item
+        next_metadata_items[plan.output_key].update(deploy_item)
 
-    emit(log, f"writing {METADATA_CACHE_FILENAME}")
-    write_cache(context.metadata_path, next_metadata_items, deploy_items=next_deploy_items)
-    uploaded_paths.append(METADATA_CACHE_FILENAME)
+    if metadata_changed:
+        emit(log, f"writing {METADATA_CACHE_FILENAME}")
+        remote_metadata_path = context.metadata_path.with_name(f"{context.metadata_path.name}.remote-upload")
+        write_cache(
+            remote_metadata_path,
+            next_metadata_items,
+            deploy_run_signature=context.deploy_run_signature,
+            include_item_upload_state=False,
+        )
+        uploaded_paths.append(METADATA_CACHE_FILENAME)
 
-    upload_remote_files(rclone_bin, context.remote_root, context.staging_root, uploaded_paths, log=log)
+        emit(log, f"uploading {METADATA_CACHE_FILENAME}")
+        upload_remote_file(rclone_bin, context.remote_root, remote_metadata_path, METADATA_CACHE_FILENAME)
+        remote_metadata_path.unlink(missing_ok=True)
 
-    dangling = sorted(dangling_remote_files(context.remote_files, expected_files, context.prune_categories))
-    delete_remote_files(rclone_bin, context.remote_root, dangling, log=log)
+        write_cache(
+            context.metadata_path,
+            next_metadata_items,
+            deploy_run_signature=context.deploy_run_signature,
+            include_item_upload_state=False,
+        )
+    else:
+        emit(log, f"skipping {METADATA_CACHE_FILENAME}: unchanged")
+
+    delete_remote_files(rclone_bin, context.remote_root, list(context.dangling_paths), log=log)
 
     if not keep_staging:
         emit(log, f"cleaning staging directory: {context.staging_root}")
@@ -378,7 +528,7 @@ def finalize_deploy(
 
     return DeploySummary(
         uploaded=len(uploaded_paths),
-        deleted=len(dangling),
+        deleted=len(context.dangling_paths),
         skipped=sum(1 for plan in context.plans if not plan.changed),
         changed=sum(1 for plan in context.plans if plan.changed),
         metadata_path=context.metadata_path,
@@ -405,6 +555,71 @@ def deploy_tracking_item(plan: DeployJobPlan, *, deployed_at: str | None = None)
     return item
 
 
+def pending_deploy_tracking_item(plan: DeployJobPlan) -> dict[str, Any]:
+    item = deploy_tracking_item(plan)
+    item[ITEM_UPLOAD_PENDING_KEY] = False
+    return item
+
+
+def write_deploy_journal(
+    metadata_path: Path,
+    metadata_items: dict[str, dict[str, Any]],
+    *,
+    deploy_run_signature: str,
+    metadata_upload_pending: bool,
+) -> None:
+    write_cache(
+        metadata_path,
+        metadata_items,
+        deploy_run_signature=deploy_run_signature,
+        deploy_run_status=DEPLOY_RUN_STATUS_IN_PROGRESS,
+        metadata_upload_pending=metadata_upload_pending,
+        include_item_upload_state=True,
+    )
+
+
+def record_pending_deploy_item(
+    context: DeployContext,
+    plan: DeployJobPlan,
+    *,
+    ffprobe_bin: str,
+) -> dict[str, Any]:
+    deploy_item = pending_deploy_tracking_item(plan)
+    item = build_metadata_cache_item(
+        plan.job.output_file,
+        ffprobe_bin=ffprobe_bin,
+        deploy_item=deploy_item,
+    )
+    if item is None:
+        raise ConversionError(f"failed to probe metadata for staged output: {plan.job.output_file}")
+    item.update(deploy_item)
+    context.metadata_items[plan.output_key] = item
+    deploy_state = deploy_state_from_metadata_item(item)
+    if deploy_state is not None:
+        context.state_items[plan.output_key] = deploy_state
+    write_deploy_journal(
+        context.metadata_path,
+        context.metadata_items,
+        deploy_run_signature=context.deploy_run_signature,
+        metadata_upload_pending=True,
+    )
+    return item
+
+
+def log_dry_run_remote_actions(
+    log: DeployLogger | None,
+    *,
+    uploads: list[str],
+    deletes: list[str],
+) -> None:
+    emit(log, f"dry run: would upload {len(uploads)} file(s)")
+    for index, relpath in enumerate(uploads, start=1):
+        emit(log, f"dry run: would upload {index}/{len(uploads)}: {relpath}")
+    emit(log, f"dry run: would delete {len(deletes)} dangling remote file(s)")
+    for index, relpath in enumerate(deletes, start=1):
+        emit(log, f"dry run: would delete {index}/{len(deletes)}: {relpath}")
+
+
 def staged_output_is_ready(
     job: Job,
     output_key: str,
@@ -423,6 +638,10 @@ def staged_output_is_ready(
         return False
     stat = job.output_file.stat()
     return staged_item.get("size") == stat.st_size and staged_item.get("modTimeUnixNano") == stat.st_mtime_ns
+
+
+def pending_output_files_ready(job: Job) -> bool:
+    return job.output_file.is_file() and cover_output_path_for_job(job).is_file()
 
 
 def dangling_remote_files(
@@ -521,6 +740,17 @@ def download_remote_file(rclone_bin: str, remote_root: str, relpath: str, output
     )
 
 
+def download_remote_file_if_exists(rclone_bin: str, remote_root: str, relpath: str, output_path: Path) -> bool:
+    try:
+        download_remote_file(rclone_bin, remote_root, relpath, output_path)
+    except ConversionError as exc:
+        message = str(exc).lower()
+        if "not found" in message or "doesn't exist" in message or "does not exist" in message:
+            return False
+        raise
+    return True
+
+
 def upload_remote_file(rclone_bin: str, remote_root: str, input_path: Path, relpath: str) -> None:
     if not input_path.is_file():
         raise ConversionError(f"staged deploy file does not exist: {input_path}")
@@ -550,16 +780,54 @@ def delete_remote_file(rclone_bin: str, remote_root: str, relpath: str) -> None:
     )
 
 
+def remove_empty_remote_dir(rclone_bin: str, remote_root: str, relpath: str) -> None:
+    run_rclone(
+        rclone_bin,
+        ["rmdir", remote_file_path(remote_root, relpath)],
+    )
+
+
 def delete_remote_files(
     rclone_bin: str,
     remote_root: str,
     relpaths: list[str],
     *,
+    remote_files: set[str] | None = None,
     log: DeployLogger | None = None,
 ) -> None:
     for index, relpath in enumerate(relpaths, start=1):
         emit(log, f"deleting dangling remote file {index}/{len(relpaths)}: {relpath}")
         delete_remote_file(rclone_bin, remote_root, relpath)
+    for index, relpath in enumerate(empty_parent_dirs_for_deleted_files(relpaths, remote_files), start=1):
+        emit(log, f"removing empty remote directory {index}: {relpath}")
+        try:
+            remove_empty_remote_dir(rclone_bin, remote_root, relpath)
+        except ConversionError as exc:
+            if remote_files is not None or not is_remote_dir_not_empty_error(exc):
+                raise
+
+
+def empty_parent_dirs_for_deleted_files(relpaths: list[str], remote_files: set[str] | None) -> list[str]:
+    candidates = {
+        PurePosixPath(relpath).parent.as_posix()
+        for relpath in relpaths
+        if PurePosixPath(relpath).parent.as_posix() != "."
+    }
+    if remote_files is None:
+        return sorted(candidates, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
+    deleted = set(relpaths)
+    remaining = remote_files - deleted
+    empty_dirs = [
+        dirname
+        for dirname in candidates
+        if not any(path == dirname or path.startswith(f"{dirname}/") for path in remaining)
+    ]
+    return sorted(empty_dirs, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
+
+
+def is_remote_dir_not_empty_error(exc: ConversionError) -> bool:
+    message = str(exc).lower()
+    return "not empty" in message or "directory not empty" in message
 
 
 def run_rclone_progress(rclone_bin: str, args: list[str]) -> None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 import pytest
+import io
 import json
 import subprocess
 import tempfile
 from contextlib import ExitStack, contextmanager
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Iterator
 from unittest import mock
@@ -11,7 +13,7 @@ from abridged_convert.app import main
 from abridged_convert.common import source_signature
 from abridged_convert.deploy import validate_remote_relpath
 from abridged_convert.metadata import METADATA_CACHE_FILENAME
-from abridged_convert.models import ConversionResult, VideoEncodingConfig
+from abridged_convert.models import ConversionError, ConversionResult, VideoEncodingConfig
 
 class FakeRclone:
 
@@ -29,6 +31,8 @@ class FakeRclone:
             source, destination = (args[1], args[2])
             if source.startswith(f'{self.remote_root}/'):
                 relpath = source.removeprefix(f'{self.remote_root}/')
+                if relpath not in self.files:
+                    raise ConversionError(f'not found: {relpath}')
                 Path(destination).parent.mkdir(parents=True, exist_ok=True)
                 Path(destination).write_bytes(self.files[relpath])
             elif destination.startswith(f'{self.remote_root}/'):
@@ -44,6 +48,14 @@ class FakeRclone:
             relpath = destination.removeprefix(f'{self.remote_root}/')
             self.files.pop(relpath, None)
             return subprocess.CompletedProcess([rclone_bin, *args], 0, stdout='', stderr='')
+        if args[0] == 'rmdir':
+            destination = args[1]
+            if not destination.startswith(f'{self.remote_root}/'):
+                raise AssertionError(f'rmdir left remote root: {args}')
+            relpath = destination.removeprefix(f'{self.remote_root}/').rstrip('/')
+            if any(path == relpath or path.startswith(f'{relpath}/') for path in self.files):
+                raise AssertionError(f'rmdir called for non-empty remote directory: {args}')
+            return subprocess.CompletedProcess([rclone_bin, *args], 0, stdout='', stderr='')
         raise AssertionError(f'unexpected rclone call: {args}')
 
     def assert_remote_root(self, value: str) -> None:
@@ -55,6 +67,9 @@ class FakeRclone:
 
     def deleted_paths(self) -> list[str]:
         return [args[1].removeprefix(f'{self.remote_root}/') for args in self.calls if args[0] == 'deletefile']
+
+    def removed_dirs(self) -> list[str]:
+        return [args[1].removeprefix(f'{self.remote_root}/') for args in self.calls if args[0] == 'rmdir']
 
 class DeployTests:
 
@@ -89,6 +104,10 @@ class DeployTests:
         assert item['coverPath'] == 'Shots/[Creator] Shot/1.webp'
         assert 'source' in item
         assert 'deployedAt' in item
+        assert 'uploaded' not in item
+        assert 'deployRunSignature' in metadata
+        assert 'deployRunStatus' not in metadata
+        assert 'metadataUploadPending' not in metadata
         assert 'deploy' not in metadata
 
     def test_unchanged_deploy_preserves_remote_metadata_and_skips_media_uploads(self) -> None:
@@ -102,10 +121,41 @@ class DeployTests:
         assert exit_code == 0
         convert_job.assert_not_called()
         assert rclone.uploaded_media_paths() == []
+        assert not any(args[0] == 'copyto' and args[2] == f'{self.remote_root}/{METADATA_CACHE_FILENAME}' for args in rclone.calls)
         next_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
+        assert next_metadata == metadata
         assert next_metadata['items'][output_key]['description'] == 'remote'
         assert next_metadata['items'][output_key]['outputPath'] == output_key
         assert 'deploy' not in next_metadata
+
+    def test_unchanged_deploy_matches_source_path_and_size_without_mtime(self) -> None:
+        source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
+        output_key = 'Shots/[Creator] Shot/1.mp4'
+        cover_key = 'Shots/[Creator] Shot/1.webp'
+        source_match = {'path': 'Shots/[Creator] Shot/1.mkv', 'size': source.stat().st_size, 'modTimeUnixNano': -1}
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_match, 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
+        with self._patched_deploy(rclone) as convert_job:
+            exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
+        assert exit_code == 0
+        convert_job.assert_not_called()
+        assert rclone.uploaded_media_paths() == []
+
+    def test_direct_category_deploy_uses_archive_relative_source_signature(self) -> None:
+        source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
+        output_key = 'Shots/[Creator] Shot/1.mp4'
+        cover_key = 'Shots/[Creator] Shot/1.webp'
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
+
+        with self._patched_deploy(rclone) as convert_job:
+            exit_code = main([str(self.archive / 'Shots'), str(self.stage), '--deploy', self.remote_root])
+
+        assert exit_code == 0
+        convert_job.assert_not_called()
+        assert rclone.uploaded_media_paths() == []
+        next_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
+        assert next_metadata['items'][output_key]['source'] == source_signature(self.archive, source)
 
     def test_rename_uploads_new_path_and_deletes_old_remote_path(self) -> None:
         old_output = 'Shots/[Creator] Old Shot/1.mp4'
@@ -119,6 +169,7 @@ class DeployTests:
         assert old_output not in rclone.files
         assert old_cover not in rclone.files
         assert sorted(rclone.deleted_paths()) == [old_output, old_cover]
+        assert 'Shots/[Creator] Old Shot' in rclone.removed_dirs()
 
     def test_category_limited_deploy_prunes_only_selected_category(self) -> None:
         source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
@@ -135,12 +186,32 @@ class DeployTests:
         assert exit_code == 0
         convert_job.assert_not_called()
         assert sorted(rclone.deleted_paths()) == [old_output, old_cover]
+        assert 'Shots/[Creator] Old Shot' in rclone.removed_dirs()
         assert song_output in rclone.files
         assert song_cover in rclone.files
         next_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
         assert set(next_metadata['items']) == {output_key, song_output}
         assert next_metadata['items'][song_output]['durationSeconds'] == 9
         assert next_metadata['items'][song_output]['outputPath'] == song_output
+
+    def test_deploy_dry_run_logs_planned_uploads_and_deletes(self) -> None:
+        old_output = 'Shots/[Creator] Old Shot/1.mp4'
+        old_cover = 'Shots/[Creator] Old Shot/1.webp'
+        rclone = FakeRclone(self.remote_root, {old_output: b'old video', old_cover: b'old cover'})
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self._patched_deploy(rclone) as convert_job:
+                exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--deploy-dry-run'])
+        output = stdout.getvalue()
+        assert exit_code == 0
+        convert_job.assert_not_called()
+        assert set(rclone.files) == {old_cover, old_output}
+        assert not (self.stage / 'Shots' / '[Creator] Shot' / '1.mp4').exists()
+        assert 'Deploy: dry run: would upload 3 file(s)' in output
+        assert 'Deploy: dry run: would upload 1/3: Shots/[Creator] Shot/1.mp4' in output
+        assert 'Deploy: dry run: would upload 2/3: Shots/[Creator] Shot/1.webp' in output
+        assert f'Deploy: dry run: would upload 3/3: {METADATA_CACHE_FILENAME}' in output
+        assert 'Deploy: dry run: would delete 0 dangling remote file(s)' in output
 
     def test_interrupted_deploy_reuses_staged_output_on_next_run(self) -> None:
         rclone = FakeRclone(self.remote_root)
@@ -153,6 +224,11 @@ class DeployTests:
         assert (self.stage / 'Shots' / '[Creator] Shot' / '1.webp').is_file()
         assert convert_job.call_count == 1
         assert rclone.uploaded_media_paths() == []
+        interrupted_metadata = json.loads((self.stage / METADATA_CACHE_FILENAME).read_text(encoding='utf-8'))
+        interrupted_item = interrupted_metadata['items']['Shots/[Creator] Shot/1.mp4']
+        assert interrupted_metadata['deployRunStatus'] == 'inProgress'
+        assert interrupted_metadata['metadataUploadPending'] is True
+        assert interrupted_item['uploaded'] is False
         with self._patched_deploy(rclone) as resumed_convert_job:
             resumed_exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
         assert resumed_exit_code == 0
@@ -160,6 +236,10 @@ class DeployTests:
         assert 'Shots/[Creator] Shot/1.mp4' in rclone.files
         assert 'Shots/[Creator] Shot/1.webp' in rclone.files
         assert METADATA_CACHE_FILENAME in rclone.files
+        remote_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
+        assert 'deployRunStatus' not in remote_metadata
+        assert 'metadataUploadPending' not in remote_metadata
+        assert 'uploaded' not in remote_metadata['items']['Shots/[Creator] Shot/1.mp4']
 
     def test_bootstrap_deploy_generates_local_metadata_and_state_without_conversion(self) -> None:
         self._write_existing_outputs()

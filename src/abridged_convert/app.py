@@ -11,10 +11,13 @@ from abridged_convert.common import normalize_categories, source_signature
 from abridged_convert.constants import CATEGORY_ORDER
 from abridged_convert.conversion import convert_job
 from abridged_convert.deploy import (
+    DeployJobPlan,
     DeploySummary,
     bootstrap_deploy_from_existing_outputs,
     finalize_deploy,
     prepare_deploy_context,
+    record_pending_deploy_item,
+    relative_output_key,
 )
 from abridged_convert.discovery import discover_jobs, resolve_input_roots
 from abridged_convert.media import cover_output_path_for_job, resolve_video_handling_plan, validate_tools
@@ -128,6 +131,13 @@ def resolve_cli_dirs(parser: argparse.ArgumentParser, args: argparse.Namespace) 
     return input_dir.resolve(), output_dir.resolve()
 
 
+def source_signature_root_for_input(input_dir: Path, category_roots: dict[str, Path]) -> Path:
+    resolved_input = input_dir.resolve()
+    if any(category_root.resolve() == resolved_input for category_root in category_roots.values()):
+        return resolved_input.parent
+    return resolved_input
+
+
 def print_metadata_status(
     *,
     discovered: int,
@@ -162,6 +172,32 @@ def print_deploy_summary(summary: DeploySummary, *, remote: str | None) -> None:
     )
 
 
+def finalize_deploy_plan_for_conversion(
+    plan: DeployJobPlan,
+    ffprobe_bin: str,
+    ffmpeg_bin: str,
+    staging_root: Path,
+    encoding_by_job: dict[tuple[str, str], VideoEncodingConfig],
+) -> DeployJobPlan:
+    output_suffix, encoding = resolve_video_handling_plan(ffprobe_bin, ffmpeg_bin, plan.job.source_video)
+    job = replace(plan.job, output_file=plan.job.output_file.with_suffix(output_suffix))
+    encoding_by_job[(str(job.source_video), str(job.output_file))] = encoding
+    return replace(
+        plan,
+        job=job,
+        output_key=relative_output_key(staging_root, job.output_file),
+        cover_key=relative_output_key(staging_root, cover_output_path_for_job(job)),
+    )
+
+
+def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: object, next_plan: DeployJobPlan) -> None:
+    for index, plan in enumerate(plans):
+        if plan.job is original_job or str(plan.job.source_video) == str(next_plan.job.source_video):
+            plans[index] = next_plan
+            return
+    plans.append(next_plan)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser, args = parse_args(argv or sys.argv[1:])
     input_dir, output_dir = resolve_cli_dirs(parser, args)
@@ -175,10 +211,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         validate_tools(args.ffmpeg, args.ffprobe)
         requested_categories = normalize_categories(args.categories or CATEGORY_ORDER)
-        _, categories, _ = resolve_input_roots(input_dir, requested_categories)
+        category_roots, categories, _ = resolve_input_roots(input_dir, requested_categories)
+        source_signature_root = source_signature_root_for_input(input_dir, category_roots)
         jobs, discovery_failures = discover_jobs(input_dir, categories, output_dir)
         encoding_by_job: dict[tuple[str, str], VideoEncodingConfig] = {}
-        if not args.bootstrap_deploy:
+        if not args.bootstrap_deploy and not args.deploy:
             planned_jobs = []
             for job in jobs:
                 output_suffix, encoding = resolve_video_handling_plan(args.ffprobe, args.ffmpeg, job.source_video)
@@ -194,6 +231,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 rclone_bin=args.rclone,
                 remote_root=args.deploy,
                 input_root=input_dir,
+                source_signature_root=source_signature_root,
                 staging_root=output_dir,
                 jobs=jobs,
                 prune_categories=categories,
@@ -216,12 +254,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                 rclone_bin=args.rclone,
                 remote_root=args.deploy,
                 input_root=input_dir,
+                source_signature_root=source_signature_root,
                 staging_root=output_dir,
                 jobs=jobs,
                 prune_categories=categories,
                 force=args.overwrite,
                 log=early_log,
             )
+            jobs = [plan.job for plan in deploy_context.plans]
         ui = TerminalUI(
             repo_root=input_dir,
             categories=categories,
@@ -296,6 +336,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 continue
 
             if deploy_context is not None and operation_dry_run:
+                if deploy_plan is not None and deploy_plan.needs_conversion:
+                    deploy_plan = finalize_deploy_plan_for_conversion(
+                        deploy_plan,
+                        args.ffprobe,
+                        args.ffmpeg,
+                        deploy_context.staging_root,
+                        encoding_by_job,
+                    )
+                    replace_deploy_context_plan(deploy_context.plans, job, deploy_plan)
                 result = ConversionResult(
                     category=job.category,
                     entry_dir=job.entry_dir,
@@ -325,16 +374,28 @@ def main(argv: Iterable[str] | None = None) -> int:
                 successful_deploy_outputs.add(deploy_plan.output_key)
                 continue
 
-            ui.mark_running(job)
+            display_job = job
+            work_job = job
+            if deploy_context is not None and deploy_plan is not None and deploy_plan.needs_conversion:
+                deploy_plan = finalize_deploy_plan_for_conversion(
+                    deploy_plan,
+                    args.ffprobe,
+                    args.ffmpeg,
+                    deploy_context.staging_root,
+                    encoding_by_job,
+                )
+                replace_deploy_context_plan(deploy_context.plans, job, deploy_plan)
+                work_job = deploy_plan.job
+            ui.mark_running(display_job)
             result = convert_job(
-                job,
+                work_job,
                 ffmpeg_bin=args.ffmpeg,
                 ffprobe_bin=args.ffprobe,
-                encoding=encoding_by_job[(str(job.source_video), str(job.output_file))],
+                encoding=encoding_by_job[(str(work_job.source_video), str(work_job.output_file))],
                 overwrite=args.overwrite or deploy_context is not None,
                 dry_run=args.dry_run,
             )
-            ui.mark_result(job, result)
+            ui.mark_result(display_job, result)
             ui.print_result_line(result)
             if result.success:
                 if result.skipped:
@@ -342,30 +403,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 else:
                     converted += 1
                     if deploy_context is not None and deploy_plan is not None:
-                        deploy_item = {
-                            "source": source_signature(input_dir, job.source_video),
-                            "outputPath": deploy_plan.output_key,
-                            "coverPath": deploy_plan.cover_key,
-                        }
-                        update_summary = update_metadata_cache_item_with_tracking(
-                            output_dir,
-                            result.output_file,
-                            ffprobe_bin=args.ffprobe,
-                            deploy_item=deploy_item,
-                        )
+                        record_pending_deploy_item(deploy_context, deploy_plan, ffprobe_bin=args.ffprobe)
                         metadata_discovered += 1
-                        metadata_output_path = update_summary.output_path
-                        if update_summary.reused:
-                            metadata_reused += 1
-                        if update_summary.probed:
-                            metadata_probed += 1
-                        if update_summary.failed:
-                            metadata_failed += 1
+                        metadata_output_path = deploy_context.metadata_path
+                        metadata_probed += 1
                         successful_deploy_outputs.add(deploy_plan.output_key)
                 if deploy_context is None and not args.dry_run:
                     output_key = cache_key_for_path(output_dir, result.output_file)
                     deploy_item = {
-                        "source": source_signature(input_dir, job.source_video),
+                        "source": source_signature(source_signature_root, job.source_video),
                         "outputPath": output_key,
                         "coverPath": cache_key_for_path(output_dir, cover_output_path_for_job(job)),
                     }

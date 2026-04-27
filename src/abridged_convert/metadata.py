@@ -15,6 +15,11 @@ from abridged_convert.models import ConversionError
 
 METADATA_CACHE_FILENAME = ".abridged-video-metadata.json"
 METADATA_CACHE_VERSION = 2
+DEPLOY_RUN_SIGNATURE_KEY = "deployRunSignature"
+DEPLOY_RUN_STATUS_KEY = "deployRunStatus"
+DEPLOY_RUN_STATUS_IN_PROGRESS = "inProgress"
+METADATA_UPLOAD_PENDING_KEY = "metadataUploadPending"
+ITEM_UPLOAD_PENDING_KEY = "uploaded"
 
 
 @dataclass(frozen=True)
@@ -270,7 +275,7 @@ def build_metadata_cache_item(
 
 
 def merge_deploy_tracking(item: dict[str, Any], deploy_item: dict[str, Any]) -> None:
-    for deploy_key in ("source", "outputPath", "coverPath", "deployedAt"):
+    for deploy_key in ("source", "outputPath", "coverPath", "deployedAt", ITEM_UPLOAD_PENDING_KEY):
         if deploy_key in deploy_item:
             item[deploy_key] = deploy_item[deploy_key]
 
@@ -326,7 +331,7 @@ def top_level_dirs(root: Path) -> list[Path]:
     return sorted(path for path in root.iterdir() if path.is_dir())
 
 
-def load_cache_items(cache_path: Path) -> dict[str, dict[str, Any]]:
+def load_cache_document(cache_path: Path) -> dict[str, Any]:
     if not cache_path.exists():
         return {}
 
@@ -335,7 +340,16 @@ def load_cache_items(cache_path: Path) -> dict[str, dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return {}
 
+    if not isinstance(cache, dict):
+        return {}
     if cache.get("version") != METADATA_CACHE_VERSION:
+        return {}
+    return cache
+
+
+def load_cache_items(cache_path: Path) -> dict[str, dict[str, Any]]:
+    cache = load_cache_document(cache_path)
+    if not cache:
         return {}
     items = cache.get("items")
     if not isinstance(items, dict):
@@ -345,12 +359,8 @@ def load_cache_items(cache_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def load_cache_deploy_items(cache_path: Path) -> dict[str, dict[str, Any]]:
-    if not cache_path.exists():
-        return {}
-
-    try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    cache = load_cache_document(cache_path)
+    if not cache:
         return {}
 
     items = cache.get("items")
@@ -510,6 +520,10 @@ def write_cache(
     items: dict[str, dict[str, Any]],
     *,
     deploy_items: dict[str, dict[str, Any]] | None = None,
+    deploy_run_signature: str | None = None,
+    deploy_run_status: str | None = None,
+    metadata_upload_pending: bool | None = None,
+    include_item_upload_state: bool = True,
 ) -> None:
     merged_items = {
         key: dict(value)
@@ -523,8 +537,14 @@ def write_cache(
 
     cache = {
         "version": METADATA_CACHE_VERSION,
-        "items": dict(sorted(merged_items.items())),
+        "items": dict(sorted(clean_metadata_items(merged_items, include_upload_state=include_item_upload_state).items())),
     }
+    if deploy_run_signature is not None:
+        cache[DEPLOY_RUN_SIGNATURE_KEY] = deploy_run_signature
+    if deploy_run_status is not None:
+        cache[DEPLOY_RUN_STATUS_KEY] = deploy_run_status
+    if metadata_upload_pending is not None:
+        cache[METADATA_UPLOAD_PENDING_KEY] = metadata_upload_pending
     data = json.dumps(cache, indent=2, ensure_ascii=False)
     temp_path = cache_path.with_name(f"{cache_path.name}.tmp")
     try:
@@ -533,3 +553,18 @@ def write_cache(
     except OSError as exc:
         temp_path.unlink(missing_ok=True)
         raise ConversionError(f"failed to write metadata cache: {exc}") from exc
+
+
+def clean_metadata_items(
+    items: dict[str, dict[str, Any]],
+    *,
+    include_upload_state: bool,
+) -> dict[str, dict[str, Any]]:
+    if include_upload_state:
+        return items
+    cleaned: dict[str, dict[str, Any]] = {}
+    for key, item in items.items():
+        next_item = dict(item)
+        next_item.pop(ITEM_UPLOAD_PENDING_KEY, None)
+        cleaned[key] = next_item
+    return cleaned

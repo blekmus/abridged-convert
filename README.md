@@ -48,11 +48,26 @@ abridged-convert Archive Web --deploy bitpile:Abridged --bootstrap-deploy
 ```
 
 Deploy mode treats `OUTPUT_DIR` as temporary staging. It downloads the remote
-`.abridged-video-metadata.json`, uses each item's deploy tracking fields to
-convert only new or changed files, uploads staged media and the updated metadata
-file with `rclone`, deletes remote files that are no longer expected, then
-removes the local staging directory unless `--keep-staging` is used. The rclone
-remote must point at the dedicated catalog folder, not a shared parent
+`.abridged-video-metadata.json` and treats that metadata as the source of truth
+for already-uploaded files. Unchanged entries are matched by the recorded
+`source.path` and `source.size`, so deploy startup does not `ffprobe` every file
+in the selected archive tree. `ffprobe` is only run for entries that are new,
+changed, forced with `--overwrite`, or missing staged output during resume.
+
+Deploy uses a resumable local journal in `OUTPUT_DIR/.abridged-video-metadata.json`.
+A clean deploy creates a `deployRunSignature`; if the run is interrupted, the
+next run sees the in-progress signature and resumes from the local journal
+instead of downloading the remote metadata again. Successfully converted entries
+are written to the journal immediately with a local `uploaded: false` marker.
+During upload, that marker is cleared only after both the video and cover are
+uploaded. Local-only journal fields are stripped from the remote metadata, while
+`deployRunSignature` is kept as the run identifier.
+
+When there are no changed entries and no dangling remote entries to prune,
+deploy skips uploading the metadata file because the remote metadata would be
+unchanged. When entries are pruned, deploy deletes the recorded remote
+`outputPath` and `coverPath`, then removes the now-empty entry directory. The
+rclone remote must point at the dedicated catalog folder, not a shared parent
 directory.
 
 Use `--bootstrap-deploy` when `OUTPUT_DIR` already contains the converted MP4
