@@ -1,7 +1,10 @@
 from __future__ import annotations
+import sys
 import tempfile
 from pathlib import Path
-from abridged_convert.app import parse_args, resolve_cli_dirs
+from unittest import mock
+import pytest
+from abridged_convert.app import main, parse_args, resolve_cli_dirs
 from abridged_convert.discovery import discover_jobs, resolve_input_roots
 
 class EntrypointBehaviorTests:
@@ -18,6 +21,13 @@ class EntrypointBehaviorTests:
         input_dir, output_dir = resolve_cli_dirs(parser, args)
         assert input_dir == Path.cwd()
         assert output_dir == Path.cwd() / 'Web'
+
+    def test_main_with_empty_argv_does_not_read_process_argv(self) -> None:
+        # An explicit empty list means "no arguments", so the parser must reject it rather than fall back to sys.argv.
+        with mock.patch.object(sys, 'argv', ['abridged-convert', str(self.root), str(self.root / 'Web'), '--dry-run']):
+            with pytest.raises(SystemExit) as exc_info:
+                main([])
+        assert exc_info.value.code == 2
 
     def test_root_input_processes_all_present_categories(self) -> None:
         shots_entry = self.root / 'Shots' / '[Creator] Shot Entry'

@@ -243,6 +243,58 @@ class DeployTests:
         assert 'metadataUploadPending' not in remote_metadata
         assert 'uploaded' not in remote_metadata['items']['Shots/[Creator] Shot/1.mp4']
 
+    def _run_deploy(self, rclone: FakeRclone, *extra_args: str) -> tuple[int, str, mock.Mock]:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self._patched_deploy(rclone) as convert_job:
+                exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root, *extra_args])
+        return exit_code, stdout.getvalue(), convert_job
+
+    def test_deploy_dry_run_does_not_leave_a_resumable_journal(self) -> None:
+        rclone = FakeRclone(self.remote_root)
+        exit_code, _, _ = self._run_deploy(rclone, '--deploy-dry-run')
+        assert exit_code == 0
+        assert not (self.stage / METADATA_CACHE_FILENAME).exists()
+        exit_code, output, convert_job = self._run_deploy(rclone)
+        assert exit_code == 0
+        assert 'resuming deploy run' not in output
+        assert f'downloading {METADATA_CACHE_FILENAME}' in output
+        convert_job.assert_called_once()
+
+    def test_deploy_dry_run_after_interruption_preserves_resume_point(self) -> None:
+        rclone = FakeRclone(self.remote_root)
+        with self._patched_deploy(rclone):
+            with mock.patch('abridged_convert.app.finalize_deploy', side_effect=KeyboardInterrupt):
+                assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 130
+        journal_before = (self.stage / METADATA_CACHE_FILENAME).read_bytes()
+        exit_code, output, convert_job = self._run_deploy(rclone, '--deploy-dry-run')
+        assert exit_code == 0
+        assert 'resuming deploy run' in output
+        convert_job.assert_not_called()
+        assert (self.stage / METADATA_CACHE_FILENAME).read_bytes() == journal_before
+        assert rclone.uploaded_media_paths() == []
+        exit_code, output, convert_job = self._run_deploy(rclone)
+        assert exit_code == 0
+        assert 'resuming deploy run' in output
+        convert_job.assert_not_called()
+        assert 'Shots/[Creator] Shot/1.mp4' in rclone.files
+        assert 'Shots/[Creator] Shot/1.webp' in rclone.files
+
+    def test_unchanged_deploy_with_keep_staging_closes_the_journal(self) -> None:
+        rclone = FakeRclone(self.remote_root)
+        assert self._run_deploy(rclone)[0] == 0
+        exit_code, output, convert_job = self._run_deploy(rclone, '--keep-staging')
+        assert exit_code == 0
+        convert_job.assert_not_called()
+        assert f'skipping {METADATA_CACHE_FILENAME}: unchanged' in output
+        journal = json.loads((self.stage / METADATA_CACHE_FILENAME).read_text(encoding='utf-8'))
+        assert 'deployRunStatus' not in journal
+        assert 'metadataUploadPending' not in journal
+        exit_code, output, _ = self._run_deploy(rclone, '--keep-staging')
+        assert exit_code == 0
+        assert 'resuming deploy run' not in output
+        assert f'skipping {METADATA_CACHE_FILENAME}: unchanged' in output
+
     def test_bootstrap_deploy_generates_local_metadata_and_state_without_conversion(self) -> None:
         self._write_existing_outputs()
         with mock.patch('abridged_convert.app.convert_job') as convert_job:
@@ -268,6 +320,49 @@ class DeployTests:
         assert 'Shots/[Creator] Shot/1.webp' in rclone.files
         assert METADATA_CACHE_FILENAME in rclone.files
         assert sorted(rclone.deleted_paths()) == ['Shots/[Creator] Old Shot/1.mp4', 'Shots/[Creator] Old Shot/1.webp']
+
+    def _run_bootstrap(self, rclone: FakeRclone) -> int:
+        with self._patched_rclone(rclone):
+            with mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}), mock.patch('abridged_convert.deploy.extract_source_subtitles', return_value=[]):
+                return main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--bootstrap-deploy', '--keep-staging'])
+
+    def test_bootstrap_deploy_uses_existing_webm_output(self) -> None:
+        output_dir = self.stage / 'Shots' / '[Creator] Shot'
+        output_dir.mkdir(parents=True)
+        (output_dir / '1.webm').write_bytes(b'existing webm')
+        (output_dir / '1.webp').write_bytes(b'existing cover')
+        rclone = FakeRclone(self.remote_root)
+        assert self._run_bootstrap(rclone) == 0
+        assert rclone.files['Shots/[Creator] Shot/1.webm'] == b'existing webm'
+        assert 'Shots/[Creator] Shot/1.mp4' not in rclone.files
+        metadata = json.loads((self.stage / METADATA_CACHE_FILENAME).read_text(encoding='utf-8'))
+        assert set(metadata['items']) == {'Shots/[Creator] Shot/1.webm'}
+        assert metadata['items']['Shots/[Creator] Shot/1.webm']['outputPath'] == 'Shots/[Creator] Shot/1.webm'
+        assert metadata['items']['Shots/[Creator] Shot/1.webm']['coverPath'] == 'Shots/[Creator] Shot/1.webp'
+
+    def test_bootstrap_dry_run_does_not_report_existing_subtitles_as_deletes(self) -> None:
+        self._write_existing_outputs()
+        rclone = FakeRclone(self.remote_root, {
+            'Shots/[Creator] Shot/1.mp4': b'video',
+            'Shots/[Creator] Shot/1.webp': b'cover',
+            'Shots/[Creator] Shot/1.0.en.vtt': b'WEBVTT',
+            'Shots/[Creator] Old Shot/1.0.en.vtt': b'WEBVTT',
+        })
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self._patched_rclone(rclone):
+            exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--bootstrap-deploy', '--deploy-dry-run'])
+        output = stdout.getvalue()
+        assert exit_code == 0
+        assert 'Deploy: dry run: would delete 1 dangling remote file(s)' in output
+        assert 'Deploy: dry run: would delete 1/1: Shots/[Creator] Old Shot/1.0.en.vtt' in output
+
+    def test_bootstrap_deploy_rejects_ambiguous_mp4_and_webm_outputs(self, capsys) -> None:
+        self._write_existing_outputs()
+        (self.stage / 'Shots' / '[Creator] Shot' / '1.webm').write_bytes(b'existing webm')
+        rclone = FakeRclone(self.remote_root)
+        assert self._run_bootstrap(rclone) == 2
+        assert 'both 1.mp4 and 1.webm' in capsys.readouterr().err
+        assert rclone.uploaded_media_paths() == []
 
     def test_deploy_uploads_subtitle_sidecars_and_lists_them(self) -> None:
         self.fake_subtitle_languages = ['en', 'es']
@@ -303,6 +398,19 @@ class DeployTests:
         second_convert_job.assert_not_called()
         self.extract_source_subtitles.assert_not_called()
 
+    def test_pending_upload_progress_counts_items_not_files(self) -> None:
+        self.fake_subtitle_languages = ['en', 'es']
+        second_entry = self.archive / 'Shots' / '[Creator] Second Shot'
+        second_entry.mkdir()
+        (second_entry / '1.mkv').write_text('second source', encoding='utf-8')
+        exit_code, output, _ = self._run_deploy(FakeRclone(self.remote_root))
+        assert exit_code == 0
+        progress = [line for line in output.splitlines() if 'uploading pending item' in line]
+        assert progress == [
+            'Deploy: uploading pending item 1/2: Shots/[Creator] Second Shot/1.mp4',
+            'Deploy: uploading pending item 2/2: Shots/[Creator] Shot/1.mp4',
+        ]
+
     def test_redeploy_with_fewer_subtitles_deletes_stale_remote_sidecar(self) -> None:
         self.fake_subtitle_languages = ['en', 'es']
         rclone = FakeRclone(self.remote_root)
@@ -314,6 +422,24 @@ class DeployTests:
         assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
         assert 'Shots/[Creator] Shot/1.1.es.vtt' not in rclone.files
 
+    def test_interrupted_redeploy_still_deletes_stale_remote_sidecar_on_resume(self) -> None:
+        self.fake_subtitle_languages = ['en', 'es']
+        rclone = FakeRclone(self.remote_root)
+        assert self._run_deploy(rclone)[0] == 0
+        self.fake_subtitle_languages = ['en']
+        with self._patched_deploy(rclone):
+            with mock.patch('abridged_convert.app.finalize_deploy', side_effect=KeyboardInterrupt):
+                assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--overwrite']) == 130
+        assert 'Shots/[Creator] Shot/1.1.es.vtt' in rclone.files
+        exit_code, output, convert_job = self._run_deploy(rclone)
+        assert exit_code == 0
+        assert 'resuming deploy run' in output
+        convert_job.assert_not_called()
+        assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
+        assert 'Shots/[Creator] Shot/1.1.es.vtt' not in rclone.files
+        remote_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
+        assert 'staleRemotePaths' not in remote_metadata
+
     def test_pruned_item_deletes_its_remote_subtitles(self) -> None:
         old_output = 'Shots/[Creator] Old Shot/1.mp4'
         old_cover = 'Shots/[Creator] Old Shot/1.webp'
@@ -324,6 +450,48 @@ class DeployTests:
             assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
         assert old_sub not in rclone.files
         assert old_sub in rclone.deleted_paths()
+
+    def _changed_source_remote(self, subtitles: list[str]) -> FakeRclone:
+        output = 'Shots/[Creator] Shot/1.mp4'
+        cover = 'Shots/[Creator] Shot/1.webp'
+        files = {output: b'old video', cover: b'old cover'}
+        subtitle_entries = []
+        for path in subtitles:
+            files[path] = b'WEBVTT'
+            subtitle_entries.append({'path': path, 'language': 'en', 'label': 'en', 'default': True, 'forced': False})
+        # Same source path as the archive, but a different size: the source was replaced.
+        metadata = {'version': 2, 'items': {output: {'size': 1, 'modTimeUnixNano': 1, 'source': {'path': 'Shots/[Creator] Shot/1.mkv', 'size': 999, 'modTimeUnixNano': 1}, 'outputPath': output, 'coverPath': cover, 'subtitles': subtitle_entries}}}
+        files[METADATA_CACHE_FILENAME] = json.dumps(metadata).encode('utf-8')
+        return FakeRclone(self.remote_root, files)
+
+    def test_changed_source_at_same_path_keeps_reuploaded_files(self) -> None:
+        rclone = self._changed_source_remote([])
+        with self._patched_deploy(rclone) as convert_job:
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
+        convert_job.assert_called_once()
+        assert rclone.files['Shots/[Creator] Shot/1.mp4'] == b'converted video'
+        assert rclone.files['Shots/[Creator] Shot/1.webp'] == b'converted cover'
+        assert rclone.deleted_paths() == []
+        assert rclone.removed_dirs() == []
+
+    def test_changed_source_with_fewer_subtitles_deletes_only_dropped_sidecar(self) -> None:
+        self.fake_subtitle_languages = ['en']
+        rclone = self._changed_source_remote(['Shots/[Creator] Shot/1.0.en.vtt', 'Shots/[Creator] Shot/1.1.es.vtt'])
+        with self._patched_deploy(rclone):
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
+        assert 'Shots/[Creator] Shot/1.mp4' in rclone.files
+        assert 'Shots/[Creator] Shot/1.webp' in rclone.files
+        assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
+        assert rclone.deleted_paths() == ['Shots/[Creator] Shot/1.1.es.vtt']
+        assert rclone.removed_dirs() == []
+
+    def test_changed_source_dry_run_does_not_report_reuploaded_files_as_deletes(self) -> None:
+        rclone = self._changed_source_remote([])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self._patched_deploy(rclone):
+                assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--deploy-dry-run']) == 0
+        assert 'Deploy: dry run: would delete 0 dangling remote file(s)' in output.getvalue()
 
     def test_rejects_unsafe_remote_relative_paths(self) -> None:
         with pytest.raises(Exception, match='unsafe remote relative path'):
@@ -347,7 +515,8 @@ class DeployTests:
             stack.enter_context(mock.patch('abridged_convert.app.convert_job', convert_job))
             stack.enter_context(mock.patch('abridged_convert.app.resolve_video_handling_plan', return_value=('.mp4', VideoEncodingConfig(mode='cpu', codec='libx264', extra_args=()))))
             stack.enter_context(self._patched_rclone(rclone))
-            stack.enter_context(mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}))
+            # A fresh dict per call, like the real function; a shared return_value would alias every item.
+            stack.enter_context(mock.patch('abridged_convert.deploy.build_metadata_cache_item', side_effect=lambda *_args, **_kwargs: {'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}))
             stack.enter_context(mock.patch('abridged_convert.metadata.probe_video_metadata', return_value={'durationSeconds': 1}))
             self.extract_source_subtitles = stack.enter_context(mock.patch('abridged_convert.deploy.extract_source_subtitles', side_effect=self._fake_extract_source_subtitles))
             yield convert_job

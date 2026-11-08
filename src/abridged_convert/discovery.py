@@ -36,23 +36,6 @@ def find_external_cover(entry_dir: Path) -> Path | None:
     return None
 
 
-def discover_repo_root(start: Path | None = None) -> Path:
-    candidate = (start or Path.cwd()).resolve()
-    search_roots = [candidate, *candidate.parents]
-    module_root = Path(__file__).resolve().parents[3]
-    search_roots.extend([module_root, *module_root.parents])
-
-    seen: set[Path] = set()
-    for root in search_roots:
-        if root in seen:
-            continue
-        seen.add(root)
-        if any((root / category).is_dir() for category in CATEGORY_ORDER):
-            return root
-    expected = ", ".join(CATEGORY_ORDER)
-    raise ConversionError(f"could not locate repo root containing {expected}")
-
-
 def resolve_input_roots(
     input_root: Path,
     categories: Iterable[str],

@@ -445,12 +445,15 @@ class AbridgedConvertTests:
         metadata_path = self.repo_root / 'Web' / '.abridged-video-metadata.json'
         metadata_path.write_text(json.dumps({'version': 2, 'items': {'Shots/[Creator] Old Name/1.mp4': {'size': 10, 'modTimeUnixNano': 20, 'durationSeconds': 1, 'source': {'path': 'Shots/[Creator] Old Name/1.mkv', 'size': 30, 'modTimeUnixNano': 40}, 'outputPath': 'Shots/[Creator] Old Name/1.mp4', 'coverPath': 'Shots/[Creator] Old Name/1.webp'}}}), encoding='utf-8')
         stdout = io.StringIO()
-        with redirect_stdout(stdout):
+        original_set_final_summary = TerminalUI.set_final_summary
+        with redirect_stdout(stdout), mock.patch.object(TerminalUI, 'set_final_summary', autospec=True, side_effect=original_set_final_summary) as set_final_summary:
             exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
         output = stdout.getvalue()
         assert exit_code == 0
         assert 'Summary: converted=1 skipped=0 failed=0 pruned=1' in output
         assert 'Pruned: Shots/[Creator] Old Name/1.mp4' in output
+        ui = set_final_summary.call_args.args[0]
+        assert ui.final_message == 'converted=1 skipped=0 failed=0 pruned=1'
         assert not old_output.exists()
         assert not old_cover.exists()
 

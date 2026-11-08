@@ -21,17 +21,8 @@ DEPLOY_RUN_STATUS_IN_PROGRESS = "inProgress"
 METADATA_UPLOAD_PENDING_KEY = "metadataUploadPending"
 ITEM_UPLOAD_PENDING_KEY = "uploaded"
 SUBTITLES_KEY = "subtitles"
-
-
-@dataclass(frozen=True)
-class MetadataSummary:
-    discovered: int
-    reused: int
-    probed: int
-    failed: int
-    pruned: int
-    output_path: Path
-    written: bool
+# Local journal only: remote subtitle files to delete once the interrupted run finishes.
+STALE_REMOTE_PATHS_KEY = "staleRemotePaths"
 
 
 @dataclass(frozen=True)
@@ -49,96 +40,6 @@ class MetadataPruneSummary:
     output_path: Path
     written: bool
     pruned_keys: tuple[str, ...] = ()
-
-
-def generate_metadata_cache(
-    archive_root: Path,
-    *,
-    ffprobe_bin: str,
-    categories: Iterable[str] | None = None,
-    force: bool = False,
-    strict: bool = False,
-    check: bool = False,
-) -> MetadataSummary:
-    resolved_archive_root = archive_root.resolve()
-    if not resolved_archive_root.is_dir():
-        raise ConversionError(f"metadata archive root is not a directory: {archive_root}")
-
-    cache_path = resolved_archive_root / METADATA_CACHE_FILENAME
-    existing_items = load_cache_items(cache_path)
-    existing_deploy_items = load_cache_deploy_items(cache_path)
-    selected_categories = normalize_categories(categories, allow_none=True, error_label="metadata category")
-    next_items: dict[str, dict[str, Any]] = {
-        key: value
-        for key, value in existing_items.items()
-        if selected_categories is not None and not path_is_in_categories(key, selected_categories)
-    }
-
-    discovered = 0
-    reused = 0
-    probed = 0
-    failed = 0
-    dirty = False
-
-    for video_path in discover_archive_videos(resolved_archive_root, categories=selected_categories):
-        discovered += 1
-        cache_key = cache_key_for_path(resolved_archive_root, video_path)
-        stat = video_path.stat()
-        size = stat.st_size
-        mod_time_unix_nano = stat.st_mtime_ns
-        existing_item = existing_items.get(cache_key)
-
-        if not force and item_is_fresh(existing_item, size, mod_time_unix_nano):
-            next_items[cache_key] = existing_item
-            reused += 1
-            continue
-
-        probed_item = probe_video_metadata(ffprobe_bin, video_path)
-        if probed_item is None:
-            failed += 1
-            if existing_item is not None:
-                next_items[cache_key] = existing_item
-            if strict:
-                raise ConversionError(f"failed to probe metadata for {video_path}")
-            continue
-
-        next_items[cache_key] = {
-            "size": size,
-            "modTimeUnixNano": mod_time_unix_nano,
-            **probed_item,
-        }
-        probed += 1
-        dirty = True
-
-    scoped_existing_keys = {
-        key
-        for key in existing_items
-        if selected_categories is None or path_is_in_categories(key, selected_categories)
-    }
-    pruned = len(scoped_existing_keys - set(next_items))
-    if pruned:
-        dirty = True
-
-    if check:
-        missing_or_stale = discovered - reused
-        if missing_or_stale or pruned:
-            raise ConversionError(
-                "metadata cache is incomplete or stale "
-                f"(missing_or_stale={missing_or_stale} pruned={pruned})"
-            )
-        return MetadataSummary(discovered, reused, probed, failed, pruned, cache_path, written=False)
-
-    if dirty or not cache_path.exists():
-        write_cache(cache_path, next_items, deploy_items=existing_deploy_items)
-        written = True
-    else:
-        written = False
-
-    return MetadataSummary(discovered, reused, probed, failed, pruned, cache_path, written=written)
-
-
-def update_metadata_cache_item(archive_root: Path, video_path: Path, *, ffprobe_bin: str) -> MetadataUpdateSummary:
-    return update_metadata_cache_item_with_tracking(archive_root, video_path, ffprobe_bin=ffprobe_bin)
 
 
 def update_metadata_cache_item_with_tracking(
@@ -248,8 +149,9 @@ def prune_unexpected_metadata_cache_items(
         return MetadataPruneSummary(pruned=0, output_path=cache_path, written=False)
 
     if delete_files:
+        kept_files = {path for key, item in next_items.items() for path in item_output_files(key, item)}
         for key, item in pruned_items:
-            delete_pruned_output_files(resolved_archive_root, key, item)
+            delete_pruned_output_files(resolved_archive_root, key, item, keep=kept_files)
 
     write_cache(cache_path, next_items, deploy_items=existing_deploy_items)
     return MetadataPruneSummary(pruned=len(pruned_keys), output_path=cache_path, written=True, pruned_keys=pruned_keys)
@@ -484,21 +386,28 @@ def cache_key_for_path(archive_root: Path, video_path: Path) -> str:
     return cache_path.as_posix()
 
 
-def delete_pruned_output_files(archive_root: Path, cache_key: str, item: dict[str, Any]) -> None:
+def item_output_files(cache_key: str, item: dict[str, Any]) -> list[str]:
+    """Relative paths of every file an item owns: video, cover and subtitle sidecars."""
     output_path = item.get("outputPath")
     if not isinstance(output_path, str):
         output_path = cache_key
-    delete_relative_file(archive_root, output_path)
-
     cover_path = item.get("coverPath")
-    if isinstance(cover_path, str):
-        delete_relative_file(archive_root, cover_path)
-    else:
-        inferred_cover = Path(cache_key).with_suffix(".webp").as_posix()
-        delete_relative_file(archive_root, inferred_cover)
+    if not isinstance(cover_path, str):
+        cover_path = Path(cache_key).with_suffix(".webp").as_posix()
+    return [output_path, cover_path, *item_subtitle_paths(item)]
 
-    for subtitle_path in item_subtitle_paths(item):
-        delete_relative_file(archive_root, subtitle_path)
+
+def delete_pruned_output_files(
+    archive_root: Path,
+    cache_key: str,
+    item: dict[str, Any],
+    *,
+    keep: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    for relative_path in item_output_files(cache_key, item):
+        # A surviving item can share a file name with a pruned one (e.g. 1.mp4 -> 1.webm both use 1.webp).
+        if relative_path not in keep:
+            delete_relative_file(archive_root, relative_path)
 
 
 def delete_relative_file(root: Path, relative_path: str) -> None:
@@ -542,6 +451,7 @@ def write_cache(
     deploy_run_signature: str | None = None,
     deploy_run_status: str | None = None,
     metadata_upload_pending: bool | None = None,
+    stale_remote_paths: Iterable[str] | None = None,
     include_item_upload_state: bool = True,
 ) -> None:
     merged_items = {
@@ -564,6 +474,8 @@ def write_cache(
         cache[DEPLOY_RUN_STATUS_KEY] = deploy_run_status
     if metadata_upload_pending is not None:
         cache[METADATA_UPLOAD_PENDING_KEY] = metadata_upload_pending
+    if stale_remote_paths:
+        cache[STALE_REMOTE_PATHS_KEY] = sorted(set(stale_remote_paths))
     data = json.dumps(cache, indent=2, ensure_ascii=False)
     temp_path = cache_path.with_name(f"{cache_path.name}.tmp")
     try:

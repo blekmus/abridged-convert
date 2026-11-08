@@ -202,7 +202,7 @@ def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: object
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser, args = parse_args(argv or sys.argv[1:])
+    parser, args = parse_args(sys.argv[1:] if argv is None else argv)
     input_dir, output_dir = resolve_cli_dirs(parser, args)
     ui: TerminalUI | None = None
     deploy_context = None
@@ -263,6 +263,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 jobs=jobs,
                 prune_categories=categories,
                 force=args.overwrite,
+                dry_run=operation_dry_run,
                 log=early_log,
             )
             jobs = [plan.job for plan in deploy_context.plans]
@@ -509,7 +510,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             metadata_output_path = metadata_output_path or prune_summary.output_path
 
         ui.add_pruned_items(metadata_pruned_keys)
-        ui.set_final_summary(converted=converted, skipped=skipped, failed=failures)
+        ui.set_final_summary(converted=converted, skipped=skipped, failed=failures, pruned=metadata_pruned)
         ui.finish(1 if failures else 0)
         print(
             f"Summary: converted={converted} skipped={skipped} failed={failures} pruned={metadata_pruned}",

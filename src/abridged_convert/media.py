@@ -7,12 +7,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from abridged_convert.constants import GPU_ERROR_MARKERS, IMAGE_CODECS, IMAGE_SUBTITLE_CODECS, PREFERRED_TAG_ORDER
+from abridged_convert.constants import IMAGE_CODECS, IMAGE_SUBTITLE_CODECS, PREFERRED_TAG_ORDER
 from abridged_convert.cover_finder import find_best_cover
 from abridged_convert.discovery import derived_output_title, parse_entry_name
 from abridged_convert.models import (
     ConversionError,
-    ConversionResult,
     EntryMetadata,
     Job,
     SubtitleStream,
@@ -411,11 +410,19 @@ def subtitle_output_path(output_file: Path, position: int, language: str | None)
     return output_file.with_name(f"{output_file.stem}.{position}.{subtitle_language_token(language)}.vtt")
 
 
+def is_subtitle_sidecar_name(output_stem: str, filename: str) -> bool:
+    """Whether `filename` is named like a subtitle sidecar (`<stem>.<n>.<language>.vtt`) of an output."""
+    return re.fullmatch(rf"{re.escape(output_stem)}\.\d+\.[A-Za-z0-9-]+\.vtt", filename) is not None
+
+
 def existing_subtitle_sidecars(output_file: Path) -> list[Path]:
     if not output_file.parent.is_dir():
         return []
-    pattern = re.compile(rf"^{re.escape(output_file.stem)}\.\d+\.[A-Za-z0-9-]+\.vtt$")
-    return sorted(path for path in output_file.parent.iterdir() if path.is_file() and pattern.match(path.name))
+    return sorted(
+        path
+        for path in output_file.parent.iterdir()
+        if path.is_file() and is_subtitle_sidecar_name(output_file.stem, path.name)
+    )
 
 
 def remove_subtitle_sidecars(output_file: Path) -> None:

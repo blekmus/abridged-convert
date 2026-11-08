@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -11,20 +11,19 @@ from typing import Any, Callable, Iterable
 
 from abridged_convert.common import normalize_categories, path_is_in_categories, source_signature
 from abridged_convert.constants import CATEGORY_ORDER
-from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles
+from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles, is_subtitle_sidecar_name
 from abridged_convert.metadata import (
     DEPLOY_RUN_SIGNATURE_KEY,
     DEPLOY_RUN_STATUS_IN_PROGRESS,
     DEPLOY_RUN_STATUS_KEY,
     ITEM_UPLOAD_PENDING_KEY,
     METADATA_CACHE_FILENAME,
+    STALE_REMOTE_PATHS_KEY,
     SUBTITLES_KEY,
     build_metadata_cache_item,
-    deploy_state_from_metadata_item,
     item_subtitle_paths,
     subtitle_metadata_entries,
     load_cache_document,
-    load_cache_deploy_items,
     load_cache_items,
     write_cache,
 )
@@ -43,7 +42,6 @@ class DeployJobPlan:
     changed: bool
     needs_conversion: bool
     reason: str
-    staged_metadata_item: dict[str, Any] | None = None
     # Remote video is current but its subtitle sidecars were never extracted (one-time backfill).
     subtitles_only: bool = False
 
@@ -53,10 +51,7 @@ class DeployContext:
     remote_root: str
     staging_root: Path
     metadata_path: Path
-    state_path: Path
     metadata_items: dict[str, dict[str, Any]]
-    state_items: dict[str, dict[str, Any]]
-    remote_files: set[str]
     plans: list[DeployJobPlan]
     prune_categories: tuple[str, ...]
     deploy_run_signature: str
@@ -73,7 +68,6 @@ class DeploySummary:
     skipped: int
     changed: int
     metadata_path: Path
-    state_path: Path
 
 
 def bootstrap_deploy_from_existing_outputs(
@@ -98,7 +92,6 @@ def bootstrap_deploy_from_existing_outputs(
     emit(log, f"bootstrap using existing outputs in {resolved_staging}")
 
     metadata_path = resolved_staging / METADATA_CACHE_FILENAME
-    state_path = metadata_path
     plans = [
         DeployJobPlan(
             job=job,
@@ -109,7 +102,7 @@ def bootstrap_deploy_from_existing_outputs(
             needs_conversion=False,
             reason="bootstrap",
         )
-        for job in jobs
+        for job in (job_with_existing_output(job) for job in jobs)
     ]
     uploaded_paths: list[str] = []
     metadata_items: dict[str, dict[str, Any]] = {}
@@ -155,6 +148,9 @@ def bootstrap_deploy_from_existing_outputs(
 
     dangling = sorted(dangling_remote_files(remote_files, expected_files, prune_scope))
     if dry_run:
+        # Subtitles aren't extracted in a dry run, so sidecars beside an expected video may still be valid.
+        output_keys = [plan.output_key for plan in plans]
+        dangling = [relpath for relpath in dangling if not is_sidecar_of_any(relpath, output_keys)]
         dry_run_uploads = uploaded_paths + ([METADATA_CACHE_FILENAME] if remote_root else [])
         log_dry_run_remote_actions(log, uploads=dry_run_uploads, deletes=dangling)
         return DeploySummary(
@@ -163,7 +159,6 @@ def bootstrap_deploy_from_existing_outputs(
             skipped=0,
             changed=len(plans),
             metadata_path=metadata_path,
-            state_path=state_path,
         )
 
     emit(log, f"writing {METADATA_CACHE_FILENAME}")
@@ -185,8 +180,39 @@ def bootstrap_deploy_from_existing_outputs(
         skipped=0,
         changed=len(plans),
         metadata_path=metadata_path,
-        state_path=state_path,
     )
+
+
+def is_sidecar_of_any(relpath: str, output_keys: Iterable[str]) -> bool:
+    path = PurePosixPath(relpath)
+    return any(
+        path.parent == PurePosixPath(output_key).parent
+        and is_subtitle_sidecar_name(PurePosixPath(output_key).stem, path.name)
+        for output_key in output_keys
+    )
+
+
+BOOTSTRAP_OUTPUT_SUFFIXES = (".mp4", ".webm")
+
+
+def job_with_existing_output(job: Job) -> Job:
+    """Point a discovered job at the output already on disk.
+
+    Discovery always names outputs `.mp4`; conversion may have written `.webm` instead. Bootstrap uploads
+    what exists, so it follows the file rather than re-probing the source.
+    """
+    existing = [
+        candidate
+        for candidate in (job.output_file.with_suffix(suffix) for suffix in BOOTSTRAP_OUTPUT_SUFFIXES)
+        if candidate.is_file()
+    ]
+    if len(existing) > 1:
+        names = " and ".join(path.name for path in existing)
+        raise ConversionError(f"bootstrap found both {names} in {job.output_file.parent}; remove the stale one")
+    if not existing:
+        # Leave the default name so the missing-output error names the expected file.
+        return job
+    return replace(job, output_file=existing[0])
 
 
 def prepare_deploy_context(
@@ -199,14 +225,15 @@ def prepare_deploy_context(
     jobs: list[Job],
     prune_categories: Iterable[str],
     force: bool,
+    dry_run: bool = False,
     log: DeployLogger | None = None,
 ) -> DeployContext:
     resolved_staging = staging_root.resolve()
-    resolved_staging.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        resolved_staging.mkdir(parents=True, exist_ok=True)
     safe_remote_root = validate_remote_root(remote_root)
     emit(log, f"preparing staging directory: {resolved_staging}")
     metadata_path = resolved_staging / METADATA_CACHE_FILENAME
-    state_path = metadata_path
     local_cache = load_cache_document(metadata_path)
     local_signature = local_cache.get(DEPLOY_RUN_SIGNATURE_KEY)
     resumed = (
@@ -216,31 +243,44 @@ def prepare_deploy_context(
     )
 
     if resumed:
+        # A dry run may read an interrupted run's journal, but never rewrites it, so the resume point survives.
         deploy_run_signature = local_signature
         emit(log, f"resuming deploy run: {deploy_run_signature}")
+        metadata_items = load_cache_items(metadata_path)
+        stale_paths = journal_stale_paths(local_cache)
     else:
+        stale_paths = []
         deploy_run_signature = uuid.uuid4().hex
         emit(log, f"downloading {METADATA_CACHE_FILENAME}")
-        downloaded = download_remote_file_if_exists(
-            rclone_bin,
-            safe_remote_root,
-            METADATA_CACHE_FILENAME,
-            metadata_path,
-        )
+        if dry_run:
+            # Keep the remote copy out of staging: a journal left there would make the next real run "resume".
+            with tempfile.TemporaryDirectory(prefix="abridged-convert-dry-run-") as temp_dir:
+                temp_metadata_path = Path(temp_dir) / METADATA_CACHE_FILENAME
+                downloaded = download_remote_file_if_exists(
+                    rclone_bin,
+                    safe_remote_root,
+                    METADATA_CACHE_FILENAME,
+                    temp_metadata_path,
+                )
+                metadata_items = load_cache_items(temp_metadata_path) if downloaded else {}
+        else:
+            downloaded = download_remote_file_if_exists(
+                rclone_bin,
+                safe_remote_root,
+                METADATA_CACHE_FILENAME,
+                metadata_path,
+            )
+            remote_items = load_cache_items(metadata_path) if downloaded else {}
+            write_deploy_journal(
+                metadata_path,
+                remote_items,
+                deploy_run_signature=deploy_run_signature,
+                metadata_upload_pending=False,
+            )
+            metadata_items = load_cache_items(metadata_path)
         if not downloaded:
             emit(log, f"initializing missing {METADATA_CACHE_FILENAME}")
-        remote_items = load_cache_items(metadata_path) if downloaded else {}
-        write_deploy_journal(
-            metadata_path,
-            remote_items,
-            deploy_run_signature=deploy_run_signature,
-            metadata_upload_pending=False,
-        )
 
-    metadata_items = load_cache_items(metadata_path)
-    state_items = load_cache_deploy_items(metadata_path)
-    staged_metadata_items = metadata_items
-    staged_state_items = state_items
     dangling_paths = dangling_paths_from_metadata(
         metadata_items,
         jobs=jobs,
@@ -248,15 +288,10 @@ def prepare_deploy_context(
         prune_categories=normalize_categories(prune_categories),
     )
     plans = build_deploy_plans(
-        input_root=input_root,
         source_signature_root=source_signature_root or input_root,
         staging_root=resolved_staging,
         jobs=jobs,
         metadata_items=metadata_items,
-        state_items=state_items,
-        staged_metadata_items=staged_metadata_items,
-        staged_state_items=staged_state_items,
-        remote_files=set(),
         force=force,
     )
     changed = sum(1 for plan in plans if plan.changed)
@@ -267,87 +302,61 @@ def prepare_deploy_context(
         remote_root=safe_remote_root,
         staging_root=resolved_staging,
         metadata_path=metadata_path,
-        state_path=state_path,
         metadata_items=metadata_items,
-        state_items=state_items,
-        remote_files=set(),
         plans=plans,
         prune_categories=normalize_categories(prune_categories),
         deploy_run_signature=deploy_run_signature,
         resumed=resumed,
         dangling_paths=dangling_paths,
+        stale_paths=stale_paths,
     )
+
+
+def journal_stale_paths(journal: dict[str, Any]) -> list[str]:
+    paths = journal.get(STALE_REMOTE_PATHS_KEY)
+    if not isinstance(paths, list):
+        return []
+    return [validate_remote_relpath(path) for path in paths if isinstance(path, str)]
 
 
 def build_deploy_plans(
     *,
-    input_root: Path,
-    source_signature_root: Path | None = None,
+    source_signature_root: Path,
     staging_root: Path,
     jobs: list[Job],
     metadata_items: dict[str, dict[str, Any]],
-    state_items: dict[str, dict[str, Any]],
-    staged_metadata_items: dict[str, dict[str, Any]],
-    staged_state_items: dict[str, dict[str, Any]],
-    remote_files: set[str],
     force: bool,
 ) -> list[DeployJobPlan]:
     plans: list[DeployJobPlan] = []
-    signature_root = source_signature_root or input_root
     metadata_by_source = metadata_items_by_source(metadata_items)
     for job in jobs:
-        signature = source_signature(signature_root, job.source_video)
+        signature = source_signature(source_signature_root, job.source_video)
         matched_key, matched_item = matching_metadata_item(metadata_by_source, signature)
         if matched_item is not None:
             output_key = metadata_output_key(matched_key, matched_item)
             cover_key = metadata_cover_key(output_key, matched_item)
-            job = replace_job_output(job, staging_root / Path(output_key))
+            job = replace(job, output_file=staging_root / Path(output_key))
         else:
             output_key = relative_output_key(staging_root, job.output_file)
             cover_key = relative_output_key(staging_root, cover_output_path_for_job(job))
-        existing_state = state_items.get(output_key)
-        staged_item = staged_metadata_items.get(output_key)
-        staged_state = staged_state_items.get(output_key)
-        staged_ready = staged_output_is_ready(job, output_key, cover_key, signature, staged_item, staged_state)
-        pending_upload = matched_item is not None and matched_item.get(ITEM_UPLOAD_PENDING_KEY) is False
 
-        reason = "remote unchanged"
-        changed = False
-        needs_conversion = False
         subtitles_only = False
         if force:
-            changed = True
-            needs_conversion = True
-            reason = "overwrite requested"
-        elif pending_upload:
+            changed, needs_conversion, reason = True, True, "overwrite requested"
+        elif matched_item is None:
+            # No record has this source's path and size, so something at the output path came from a different source.
+            changed, needs_conversion = True, True
+            reason = "source changed" if output_key in metadata_items else "not deployed"
+        elif matched_item.get(ITEM_UPLOAD_PENDING_KEY) is False:
+            # Converted by an interrupted run; reconvert only if its staged files are gone.
             changed = True
             needs_conversion = not pending_output_files_ready(job, matched_item)
-            reason = "pending upload" if not needs_conversion else "pending output missing"
-        elif matched_item is not None and SUBTITLES_KEY not in matched_item:
-            changed = True
-            needs_conversion = False
-            subtitles_only = True
+            reason = "pending output missing" if needs_conversion else "pending upload"
+        elif SUBTITLES_KEY not in matched_item:
+            changed, needs_conversion, subtitles_only = True, False, True
             reason = "subtitles missing"
-        elif matched_item is not None:
-            changed = False
-            needs_conversion = False
-            reason = "remote metadata match"
-        elif existing_state is None:
-            changed = True
-            needs_conversion = not staged_ready
-            reason = "staged output ready" if staged_ready else "not deployed"
-        elif existing_state.get("source") != signature:
-            changed = True
-            needs_conversion = not staged_ready
-            reason = "staged output ready" if staged_ready else "source changed"
-        elif existing_state.get("outputPath") != output_key or existing_state.get("coverPath") != cover_key:
-            changed = True
-            needs_conversion = not staged_ready
-            reason = "staged output ready" if staged_ready else "output path changed"
-        elif output_key not in metadata_items:
-            changed = True
-            needs_conversion = not staged_ready
-            reason = "staged output ready" if staged_ready else "metadata missing"
+        else:
+            changed, needs_conversion, reason = False, False, "remote metadata match"
 
         plans.append(
             DeployJobPlan(
@@ -358,15 +367,10 @@ def build_deploy_plans(
                 changed=changed,
                 needs_conversion=needs_conversion,
                 reason=reason,
-                staged_metadata_item=staged_item if staged_ready else None,
                 subtitles_only=subtitles_only,
             )
         )
     return plans
-
-
-def replace_job_output(job: Job, output_file: Path) -> Job:
-    return replace(job, output_file=output_file)
 
 
 def metadata_items_by_source(items: dict[str, dict[str, Any]]) -> dict[str, list[tuple[str, dict[str, Any]]]]:
@@ -479,16 +483,24 @@ def finalize_deploy(
         ]
         if metadata_changed:
             upload_paths.append(METADATA_CACHE_FILENAME)
-        log_dry_run_remote_actions(log, uploads=upload_paths, deletes=list(context.dangling_paths))
+        planned_paths = {relpath for plan in context.plans for relpath in (plan.output_key, plan.cover_key)}
+        dry_run_deletes = [relpath for relpath in context.dangling_paths if relpath not in planned_paths]
+        log_dry_run_remote_actions(log, uploads=upload_paths, deletes=dry_run_deletes)
         return DeploySummary(
             uploaded=len(upload_paths),
-            deleted=len(context.dangling_paths),
+            deleted=len(dry_run_deletes),
             skipped=sum(1 for plan in context.plans if not plan.changed),
             changed=sum(1 for plan in context.plans if plan.changed),
             metadata_path=context.metadata_path,
-            state_path=context.state_path,
         )
 
+    # Subtitle backfills and items uploaded before an interruption are changed but have nothing pending.
+    pending_total = sum(
+        1
+        for plan in changed_plans
+        if (context.metadata_items.get(plan.output_key) or {}).get(ITEM_UPLOAD_PENDING_KEY) is False
+    )
+    pending_index = 0
     for index, plan in enumerate(context.plans, start=1):
         # Only uploaded items get this run's timestamp; skipped items keep their existing deployedAt.
         video_uploaded = plan.changed and not plan.subtitles_only
@@ -498,7 +510,8 @@ def finalize_deploy(
             if item is None:
                 raise ConversionError(f"deploy metadata is missing changed output: {plan.output_key}")
             if item.get(ITEM_UPLOAD_PENDING_KEY) is False:
-                emit(log, f"uploading pending item {len(uploaded_paths) // 2 + 1}/{len(changed_plans)}: {plan.output_key}")
+                pending_index += 1
+                emit(log, f"uploading pending item {pending_index}/{pending_total}: {plan.output_key}")
                 item_paths = [plan.output_key, plan.cover_key, *subtitle_keys(item)]
                 upload_remote_files(rclone_bin, context.remote_root, context.staging_root, item_paths, log=log)
                 uploaded_paths.extend(item_paths)
@@ -509,6 +522,7 @@ def finalize_deploy(
                     context.metadata_items,
                     deploy_run_signature=context.deploy_run_signature,
                     metadata_upload_pending=True,
+                    stale_paths=context.stale_paths,
                 )
             item = dict(item)
             item.pop(ITEM_UPLOAD_PENDING_KEY, None)
@@ -538,24 +552,24 @@ def finalize_deploy(
         emit(log, f"uploading {METADATA_CACHE_FILENAME}")
         upload_remote_file(rclone_bin, context.remote_root, remote_metadata_path, METADATA_CACHE_FILENAME)
         remote_metadata_path.unlink(missing_ok=True)
-
-        write_cache(
-            context.metadata_path,
-            next_metadata_items,
-            deploy_run_signature=context.deploy_run_signature,
-            include_item_upload_state=False,
-        )
     else:
         emit(log, f"skipping {METADATA_CACHE_FILENAME}: unchanged")
 
-    expected_after = {
-        path
-        for key, item in next_metadata_items.items()
-        for path in (metadata_output_key(key, item), *subtitle_keys(item))
-    }
-    delete_remote_files(rclone_bin, context.remote_root, list(context.dangling_paths), log=log)
+    # Close the local journal (drops the in-progress marker) so a kept staging dir doesn't look interrupted.
+    write_cache(
+        context.metadata_path,
+        next_metadata_items,
+        deploy_run_signature=context.deploy_run_signature,
+        include_item_upload_state=False,
+    )
+
+    expected_after = referenced_remote_paths(next_metadata_items)
+    # A replaced source at the same path leaves its old entry dangling, but the new entry reuses the same
+    # output/cover/subtitle paths, which were just uploaded and must survive the cleanup.
+    dangling = [relpath for relpath in context.dangling_paths if relpath not in expected_after]
+    delete_remote_files(rclone_bin, context.remote_root, dangling, kept_files=expected_after, log=log)
     # Stale subtitle sidecars sit beside a still-deployed video, so their directories are never removed.
-    stale = sorted(set(context.stale_paths) - expected_after - set(context.dangling_paths))
+    stale = sorted(set(context.stale_paths) - expected_after - set(dangling))
     for index, relpath in enumerate(stale, start=1):
         emit(log, f"deleting stale subtitle {index}/{len(stale)}: {relpath}")
         delete_remote_file(rclone_bin, context.remote_root, relpath)
@@ -568,12 +582,22 @@ def finalize_deploy(
 
     return DeploySummary(
         uploaded=len(uploaded_paths),
-        deleted=len(context.dangling_paths),
+        deleted=len(dangling),
         skipped=sum(1 for plan in context.plans if not plan.changed),
         changed=sum(1 for plan in context.plans if plan.changed),
         metadata_path=context.metadata_path,
-        state_path=context.state_path,
     )
+
+
+def referenced_remote_paths(items: dict[str, dict[str, Any]]) -> set[str]:
+    """Every remote file (video, cover, subtitles) that the given metadata items point at."""
+    referenced: set[str] = set()
+    for key, item in items.items():
+        output_key = metadata_output_key(key, item)
+        referenced.add(output_key)
+        referenced.add(metadata_cover_key(output_key, item))
+        referenced.update(subtitle_keys(item))
+    return referenced
 
 
 def expected_remote_files(plans: list[DeployJobPlan]) -> set[str]:
@@ -581,8 +605,6 @@ def expected_remote_files(plans: list[DeployJobPlan]) -> set[str]:
     for plan in plans:
         expected.add(plan.output_key)
         expected.add(plan.cover_key)
-        if plan.staged_metadata_item is not None:
-            expected.update(subtitle_keys(plan.staged_metadata_item))
     return expected
 
 
@@ -609,6 +631,7 @@ def write_deploy_journal(
     *,
     deploy_run_signature: str,
     metadata_upload_pending: bool,
+    stale_paths: Iterable[str] = (),
 ) -> None:
     write_cache(
         metadata_path,
@@ -616,6 +639,7 @@ def write_deploy_journal(
         deploy_run_signature=deploy_run_signature,
         deploy_run_status=DEPLOY_RUN_STATUS_IN_PROGRESS,
         metadata_upload_pending=metadata_upload_pending,
+        stale_remote_paths=stale_paths,
         include_item_upload_state=True,
     )
 
@@ -640,14 +664,12 @@ def record_pending_deploy_item(
     item[SUBTITLES_KEY] = subtitle_metadata_entries(context.staging_root, subtitles or [])
     context.stale_paths.extend(set(subtitle_keys(previous_item)) - set(subtitle_keys(item)))
     context.metadata_items[plan.output_key] = item
-    deploy_state = deploy_state_from_metadata_item(item)
-    if deploy_state is not None:
-        context.state_items[plan.output_key] = deploy_state
     write_deploy_journal(
         context.metadata_path,
         context.metadata_items,
         deploy_run_signature=context.deploy_run_signature,
         metadata_upload_pending=True,
+        stale_paths=context.stale_paths,
     )
     return item
 
@@ -677,6 +699,7 @@ def backfill_subtitles(
         context.metadata_items,
         deploy_run_signature=context.deploy_run_signature,
         metadata_upload_pending=True,
+        stale_paths=context.stale_paths,
     )
     return keys
 
@@ -693,26 +716,6 @@ def log_dry_run_remote_actions(
     emit(log, f"dry run: would delete {len(deletes)} dangling remote file(s)")
     for index, relpath in enumerate(deletes, start=1):
         emit(log, f"dry run: would delete {index}/{len(deletes)}: {relpath}")
-
-
-def staged_output_is_ready(
-    job: Job,
-    output_key: str,
-    cover_key: str,
-    source: dict[str, Any],
-    staged_item: dict[str, Any] | None,
-    staged_state: dict[str, Any] | None,
-) -> bool:
-    if staged_item is None or staged_state is None:
-        return False
-    if staged_state.get("source") != source:
-        return False
-    if staged_state.get("outputPath") != output_key or staged_state.get("coverPath") != cover_key:
-        return False
-    if not pending_output_files_ready(job, staged_item):
-        return False
-    stat = job.output_file.stat()
-    return staged_item.get("size") == stat.st_size and staged_item.get("modTimeUnixNano") == stat.st_mtime_ns
 
 
 def pending_output_files_ready(job: Job, item: dict[str, Any] | None = None) -> bool:
@@ -875,12 +878,14 @@ def delete_remote_files(
     relpaths: list[str],
     *,
     remote_files: set[str] | None = None,
+    kept_files: set[str] | None = None,
     log: DeployLogger | None = None,
 ) -> None:
     for index, relpath in enumerate(relpaths, start=1):
         emit(log, f"deleting dangling remote file {index}/{len(relpaths)}: {relpath}")
         delete_remote_file(rclone_bin, remote_root, relpath)
-    for index, relpath in enumerate(empty_parent_dirs_for_deleted_files(relpaths, remote_files), start=1):
+    empty_dirs = empty_parent_dirs_for_deleted_files(relpaths, remote_files, kept_files)
+    for index, relpath in enumerate(empty_dirs, start=1):
         emit(log, f"removing empty remote directory {index}: {relpath}")
         try:
             remove_empty_remote_dir(rclone_bin, remote_root, relpath)
@@ -889,12 +894,23 @@ def delete_remote_files(
                 raise
 
 
-def empty_parent_dirs_for_deleted_files(relpaths: list[str], remote_files: set[str] | None) -> list[str]:
+def empty_parent_dirs_for_deleted_files(
+    relpaths: list[str],
+    remote_files: set[str] | None,
+    kept_files: set[str] | None = None,
+) -> list[str]:
     candidates = {
         PurePosixPath(relpath).parent.as_posix()
         for relpath in relpaths
         if PurePosixPath(relpath).parent.as_posix() != "."
     }
+    if kept_files:
+        # Directories still holding a known deployed file are not empty; don't try to remove them.
+        candidates = {
+            dirname
+            for dirname in candidates
+            if not any(path.startswith(f"{dirname}/") for path in kept_files)
+        }
     if remote_files is None:
         return sorted(candidates, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
     deleted = set(relpaths)
