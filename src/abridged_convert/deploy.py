@@ -463,7 +463,8 @@ def finalize_deploy(
         )
 
     for index, plan in enumerate(context.plans, start=1):
-        deploy_item = deploy_tracking_item(plan, deployed_at=now)
+        # Only uploaded items get this run's timestamp; skipped items keep their existing deployedAt.
+        deploy_item = deploy_tracking_item(plan, deployed_at=now if plan.changed else None)
         if plan.changed:
             item = context.metadata_items.get(plan.output_key)
             if item is None:

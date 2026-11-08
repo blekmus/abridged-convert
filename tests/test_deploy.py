@@ -191,6 +191,7 @@ class DeployTests:
         assert song_cover in rclone.files
         next_metadata = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))
         assert set(next_metadata['items']) == {output_key, song_output}
+        assert next_metadata['items'][output_key]['deployedAt'] == '2024-01-01T00:00:00+00:00'
         assert next_metadata['items'][song_output]['durationSeconds'] == 9
         assert next_metadata['items'][song_output]['outputPath'] == song_output
 
