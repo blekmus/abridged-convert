@@ -13,6 +13,7 @@ from abridged_convert.conversion import convert_job
 from abridged_convert.deploy import (
     DeployJobPlan,
     DeploySummary,
+    backfill_subtitles,
     bootstrap_deploy_from_existing_outputs,
     finalize_deploy,
     prepare_deploy_context,
@@ -22,9 +23,11 @@ from abridged_convert.deploy import (
 from abridged_convert.discovery import discover_jobs, resolve_input_roots
 from abridged_convert.media import cover_output_path_for_job, resolve_video_handling_plan, validate_tools
 from abridged_convert.metadata import (
+    SUBTITLES_KEY,
     cache_key_for_path,
     prune_missing_metadata_cache_items,
     prune_unexpected_metadata_cache_items,
+    subtitle_metadata_entries,
     update_metadata_cache_item_with_tracking,
 )
 from abridged_convert.models import ConversionError, ConversionResult, VideoEncodingConfig
@@ -236,6 +239,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 jobs=jobs,
                 prune_categories=categories,
                 ffprobe_bin=args.ffprobe,
+                ffmpeg_bin=args.ffmpeg,
                 dry_run=operation_dry_run,
                 keep_staging=args.keep_staging,
                 log=early_log,
@@ -358,6 +362,36 @@ def main(argv: Iterable[str] | None = None) -> int:
                 converted += 1
                 continue
 
+            if deploy_context is not None and deploy_plan is not None and deploy_plan.subtitles_only:
+                ui.mark_running(job)
+                result = ConversionResult(
+                    category=job.category,
+                    entry_dir=job.entry_dir,
+                    source_video=job.source_video,
+                    output_file=job.output_file,
+                )
+                try:
+                    subtitle_keys = backfill_subtitles(
+                        args.rclone,
+                        deploy_context,
+                        deploy_plan,
+                        ffmpeg_bin=args.ffmpeg,
+                        ffprobe_bin=args.ffprobe,
+                        log=early_log if not ui.enabled else None,
+                    )
+                except ConversionError as exc:
+                    result.message = str(exc)
+                    failures += 1
+                else:
+                    result.success = True
+                    result.skipped = True
+                    result.message = f"subtitles backfilled ({len(subtitle_keys)})"
+                    skipped += 1
+                    successful_deploy_outputs.add(deploy_plan.output_key)
+                ui.mark_result(job, result)
+                ui.print_result_line(result)
+                continue
+
             if deploy_context is not None and deploy_plan is not None and not deploy_plan.needs_conversion:
                 result = ConversionResult(
                     category=job.category,
@@ -403,7 +437,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                 else:
                     converted += 1
                     if deploy_context is not None and deploy_plan is not None:
-                        record_pending_deploy_item(deploy_context, deploy_plan, ffprobe_bin=args.ffprobe)
+                        record_pending_deploy_item(
+                            deploy_context,
+                            deploy_plan,
+                            ffprobe_bin=args.ffprobe,
+                            subtitles=result.subtitles,
+                        )
                         metadata_discovered += 1
                         metadata_output_path = deploy_context.metadata_path
                         metadata_probed += 1
@@ -415,6 +454,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                         "outputPath": output_key,
                         "coverPath": cache_key_for_path(output_dir, cover_output_path_for_job(job)),
                     }
+                    if result.subtitles is not None:
+                        deploy_item[SUBTITLES_KEY] = subtitle_metadata_entries(output_dir, result.subtitles)
                     update_summary = update_metadata_cache_item_with_tracking(
                         output_dir,
                         result.output_file,

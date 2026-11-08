@@ -13,10 +13,13 @@ from abridged_convert.media import (
     collect_metadata,
     cover_output_path_for_job,
     cpu_video_encoding_config,
+    expected_subtitle_sidecars,
+    extract_subtitle_sidecars,
+    remove_subtitle_sidecars,
     run_command,
     write_cover_sidecar,
 )
-from abridged_convert.models import ConversionError, ConversionResult, Job, VideoEncodingConfig
+from abridged_convert.models import ConversionError, ConversionResult, EntryMetadata, Job, VideoEncodingConfig
 
 
 def tracking_file_for_job(job: Job) -> Path:
@@ -37,6 +40,26 @@ def resume_interrupted_job(job: Job, *, dry_run: bool) -> bool:
         remove_incomplete_output(job.output_file)
         tracking_file.unlink(missing_ok=True)
     return True
+
+
+def write_sidecars(
+    ffmpeg_bin: str,
+    job: Job,
+    metadata: EntryMetadata,
+    cover_path: Path | None,
+    cover_output_path: Path,
+) -> list[dict]:
+    if cover_path is not None:
+        write_cover_sidecar(ffmpeg_bin, cover_path, cover_output_path)
+    return extract_subtitle_sidecars(ffmpeg_bin, job.source_video, metadata.subtitle_streams, job.output_file)
+
+
+def ensure_subtitle_sidecars(ffmpeg_bin: str, job: Job, metadata: EntryMetadata) -> list[dict]:
+    """For an output that already exists, (re)write its subtitle sidecars only if any are missing."""
+    expected = expected_subtitle_sidecars(job.output_file, metadata.subtitle_streams)
+    if all(sidecar["path"].is_file() for sidecar in expected):
+        return expected
+    return extract_subtitle_sidecars(ffmpeg_bin, job.source_video, metadata.subtitle_streams, job.output_file)
 
 
 def convert_job(
@@ -70,6 +93,13 @@ def convert_job(
         result.success = True
         result.skipped = True
         result.message = "already exists"
+        if not dry_run:
+            try:
+                result.subtitles = ensure_subtitle_sidecars(ffmpeg_bin, job, metadata)
+            except subprocess.CalledProcessError as exc:
+                result.success = False
+                result.skipped = False
+                result.message = exc.stderr.strip() or exc.stdout.strip() or "subtitle extraction failed"
         return result
 
     with tempfile.TemporaryDirectory(prefix="abridged-convert-") as temp_dir_name:
@@ -104,8 +134,7 @@ def convert_job(
         keep_tracking_file = False
         try:
             run_command(ffmpeg_cmd)
-            if cover_path is not None:
-                write_cover_sidecar(ffmpeg_bin, cover_path, cover_output_path)
+            result.subtitles = write_sidecars(ffmpeg_bin, job, metadata, cover_path, cover_output_path)
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
             if encoding.mode == "nvidia" and any(marker in stderr.lower() for marker in GPU_ERROR_MARKERS):
@@ -120,17 +149,18 @@ def convert_job(
                 )
                 try:
                     run_command(ffmpeg_cmd)
-                    if cover_path is not None:
-                        write_cover_sidecar(ffmpeg_bin, cover_path, cover_output_path)
+                    result.subtitles = write_sidecars(ffmpeg_bin, job, metadata, cover_path, cover_output_path)
                 except subprocess.CalledProcessError:
                     remove_incomplete_output(job.output_file)
                     cover_output_path.unlink(missing_ok=True)
+                    remove_subtitle_sidecars(job.output_file)
                     result.message = stderr
                     return result
                 except KeyboardInterrupt:
                     keep_tracking_file = True
                     remove_incomplete_output(job.output_file)
                     cover_output_path.unlink(missing_ok=True)
+                    remove_subtitle_sidecars(job.output_file)
                     raise
                 result.success = True
                 result.message = (
@@ -141,12 +171,14 @@ def convert_job(
                 return result
             remove_incomplete_output(job.output_file)
             cover_output_path.unlink(missing_ok=True)
+            remove_subtitle_sidecars(job.output_file)
             result.message = stderr
             return result
         except KeyboardInterrupt:
             keep_tracking_file = True
             remove_incomplete_output(job.output_file)
             cover_output_path.unlink(missing_ok=True)
+            remove_subtitle_sidecars(job.output_file)
             raise
         finally:
             if not keep_tracking_file:

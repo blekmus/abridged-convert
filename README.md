@@ -21,6 +21,15 @@ Default behavior:
 - prefers discovered cover image files first, then embedded cover art, otherwise generates a thumbnail from the video at the 20 second mark, falling back to the first frame for shorter videos
 - writes the chosen or generated cover beside each output video as a `.webp` sidecar, copying existing WebP covers directly and converting other formats losslessly when possible
 - copies/remuxes existing video and audio streams by default without re-encoding
+- writes each embedded text subtitle track as a `.vtt` sidecar named `<stem>.<n>.<language>.vtt` (WebVTT tracks, as embedded by yt-dlp from YouTube, are copied verbatim; other text formats are converted; image-based tracks such as PGS are skipped) and lists them under `subtitles` in the metadata:
+
+  ```json
+  "subtitles": [
+    {"path": "Shots/[Creator] Shot/1.0.en.vtt", "language": "en", "label": "en", "default": true, "forced": false}
+  ]
+  ```
+
+  `label` is the track title when the source has one, otherwise the language. An empty list means the source has no subtitles. A missing `subtitles` key means the entry was converted before subtitle support existed: local runs and deploys backfill it once from the source, extracting and uploading only the `.vtt` files without re-converting or re-uploading the video.
 
 Usage:
 

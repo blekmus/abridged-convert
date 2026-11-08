@@ -471,6 +471,63 @@ class AbridgedConvertTests:
     def _make_cover_image(self, output_path: Path, color: str) -> None:
         run([FFMPEG, '-y', '-v', 'error', '-f', 'lavfi', '-i', f'color=c={color}:s=160x90:d=1', '-frames:v', '1', str(output_path)])
 
+    def test_subtitle_streams_become_vtt_sidecars_listed_in_metadata(self) -> None:
+        entry = self.repo_root / 'Shots' / '[Creator] Subbed'
+        entry.mkdir()
+        self._make_cover_image(entry / 'cover.png', 'red')
+        source = entry / '1.mkv'
+        self._make_source_video(source, title='Subbed', description='desc', comment='comment')
+        self._add_subtitle_streams(source, [('WEBVTT\n\n00:00.000 --> 00:00.900 align:start position:0%\nhello<00:00:00.400><c> there</c>\n', '.vtt', 'en', None, True), ('1\n00:00:00,000 --> 00:00:00,900\nHola\n', '.srt', 'es', 'Spanish (manual)', False)])
+        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+        assert exit_code == 0
+        web_entry = self.repo_root / 'Web' / 'Shots' / '[Creator] Subbed'
+        english = web_entry / '1.0.en.vtt'
+        spanish = web_entry / '1.1.es.vtt'
+        assert english.read_text(encoding='utf-8').startswith('WEBVTT')
+        assert '<c> there</c>' in english.read_text(encoding='utf-8')
+        assert spanish.read_text(encoding='utf-8').startswith('WEBVTT')
+        assert 'Hola' in spanish.read_text(encoding='utf-8')
+        output_streams = ffprobe_json(web_entry / '1.mp4')['streams']
+        assert not any(stream['codec_type'] == 'subtitle' for stream in output_streams)
+        metadata_cache = json.loads((self.repo_root / 'Web' / '.abridged-video-metadata.json').read_text(encoding='utf-8'))
+        item = metadata_cache['items']['Shots/[Creator] Subbed/1.mp4']
+        assert item['subtitles'] == [{'path': 'Shots/[Creator] Subbed/1.0.en.vtt', 'language': 'en', 'label': 'en', 'default': True, 'forced': False}, {'path': 'Shots/[Creator] Subbed/1.1.es.vtt', 'language': 'es', 'label': 'Spanish (manual)', 'default': False, 'forced': False}]
+        spanish.unlink()
+        assert main(['--repo-root', str(self.repo_root), '--category', 'Shots']) == 0
+        assert spanish.is_file()
+
+    def test_source_without_subtitles_records_empty_list(self) -> None:
+        entry = self.repo_root / 'Shots' / '[Creator] Unsubbed'
+        entry.mkdir()
+        self._make_cover_image(entry / 'cover.png', 'red')
+        self._make_source_video(entry / '1.mkv', title='Unsubbed', description='desc', comment='comment')
+        assert main(['--repo-root', str(self.repo_root), '--category', 'Shots']) == 0
+        metadata_cache = json.loads((self.repo_root / 'Web' / '.abridged-video-metadata.json').read_text(encoding='utf-8'))
+        assert metadata_cache['items']['Shots/[Creator] Unsubbed/1.mp4']['subtitles'] == []
+
+    def _add_subtitle_streams(self, source: Path, subtitles: list[tuple[str, str, str | None, str | None, bool]]) -> None:
+        temp_output = source.with_name(f'{source.stem}.with-subs{source.suffix}')
+        cmd = [FFMPEG, '-y', '-v', 'error', '-i', str(source)]
+        for position, (text, suffix, _language, _title, _default) in enumerate(subtitles):
+            sub_path = source.parent / f'fixture-sub-{position}{suffix}'
+            sub_path.write_text(text, encoding='utf-8')
+            cmd.extend(['-i', str(sub_path)])
+        cmd.extend(['-map', '0'])
+        for position in range(len(subtitles)):
+            cmd.extend(['-map', f'{position + 1}:0'])
+        cmd.extend(['-c', 'copy'])
+        for position, (_text, _suffix, language, title, default) in enumerate(subtitles):
+            if language:
+                cmd.extend([f'-metadata:s:s:{position}', f'language={language}'])
+            if title:
+                cmd.extend([f'-metadata:s:s:{position}', f'title={title}'])
+            cmd.extend([f'-disposition:s:{position}', 'default' if default else '0'])
+        cmd.append(str(temp_output))
+        run(cmd)
+        temp_output.replace(source)
+        for position, (_text, suffix, *_rest) in enumerate(subtitles):
+            (source.parent / f'fixture-sub-{position}{suffix}').unlink()
+
     def _make_source_video(self, output_path: Path, *, title: str, description: str, comment: str, artist: str='Artist', album: str='Album', date: str='20240202', synopsis: str='Synopsis', attach_json: bool=False, add_cover_stream: Path | None=None, add_cover_codec: str | None=None, add_cover_attached_pic: bool=True, video_codec: str='libvpx-vp9', audio_codec: str | None=None, duration: float=1) -> None:
         cmd = [FFMPEG, '-y', '-v', 'error', '-f', 'lavfi', '-i', f'testsrc=size=160x90:rate=12:duration={duration}', '-f', 'lavfi', '-i', f'sine=frequency=1000:duration={duration}']
         if add_cover_stream is not None:

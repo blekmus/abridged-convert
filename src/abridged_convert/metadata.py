@@ -20,6 +20,7 @@ DEPLOY_RUN_STATUS_KEY = "deployRunStatus"
 DEPLOY_RUN_STATUS_IN_PROGRESS = "inProgress"
 METADATA_UPLOAD_PENDING_KEY = "metadataUploadPending"
 ITEM_UPLOAD_PENDING_KEY = "uploaded"
+SUBTITLES_KEY = "subtitles"
 
 
 @dataclass(frozen=True)
@@ -275,7 +276,7 @@ def build_metadata_cache_item(
 
 
 def merge_deploy_tracking(item: dict[str, Any], deploy_item: dict[str, Any]) -> None:
-    for deploy_key in ("source", "outputPath", "coverPath", "deployedAt", ITEM_UPLOAD_PENDING_KEY):
+    for deploy_key in ("source", "outputPath", "coverPath", SUBTITLES_KEY, "deployedAt", ITEM_UPLOAD_PENDING_KEY):
         if deploy_key in deploy_item:
             item[deploy_key] = deploy_item[deploy_key]
 
@@ -390,7 +391,22 @@ def deploy_state_from_metadata_item(item: dict[str, Any]) -> dict[str, Any] | No
     }
     if isinstance(deployed_at, str):
         state["deployedAt"] = deployed_at
+    if isinstance(item.get(SUBTITLES_KEY), list):
+        state[SUBTITLES_KEY] = item[SUBTITLES_KEY]
     return state
+
+
+def item_subtitle_paths(item: dict[str, Any]) -> list[str]:
+    """Relative paths of an item's subtitle sidecars (empty when none or not yet processed)."""
+    subtitles = item.get(SUBTITLES_KEY)
+    if not isinstance(subtitles, list):
+        return []
+    return [entry["path"] for entry in subtitles if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
+
+
+def subtitle_metadata_entries(root: Path, sidecars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert sidecars from media.extract_subtitle_sidecars (absolute paths) into metadata entries."""
+    return [{**sidecar, "path": cache_key_for_path(root, Path(sidecar["path"]))} for sidecar in sidecars]
 
 
 def item_is_fresh(item: dict[str, Any] | None, size: int, mod_time_unix_nano: int) -> bool:
@@ -480,6 +496,9 @@ def delete_pruned_output_files(archive_root: Path, cache_key: str, item: dict[st
     else:
         inferred_cover = Path(cache_key).with_suffix(".webp").as_posix()
         delete_relative_file(archive_root, inferred_cover)
+
+    for subtitle_path in item_subtitle_paths(item):
+        delete_relative_file(archive_root, subtitle_path)
 
 
 def delete_relative_file(root: Path, relative_path: str) -> None:

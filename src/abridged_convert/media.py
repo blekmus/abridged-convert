@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from abridged_convert.constants import GPU_ERROR_MARKERS, IMAGE_CODECS, PREFERRED_TAG_ORDER
+from abridged_convert.constants import GPU_ERROR_MARKERS, IMAGE_CODECS, IMAGE_SUBTITLE_CODECS, PREFERRED_TAG_ORDER
 from abridged_convert.cover_finder import find_best_cover
 from abridged_convert.discovery import derived_output_title, parse_entry_name
-from abridged_convert.models import ConversionError, ConversionResult, EntryMetadata, Job, VideoEncodingConfig
+from abridged_convert.models import (
+    ConversionError,
+    ConversionResult,
+    EntryMetadata,
+    Job,
+    SubtitleStream,
+    VideoEncodingConfig,
+)
 
 GENERATED_THUMBNAIL_TIMESTAMP = "20"
 WEBM_AUDIO_CODECS = {"opus", "vorbis"}
@@ -29,7 +38,9 @@ def ffprobe_json(ffprobe_bin: str, media_path: Path) -> dict:
             "error",
             "-show_entries",
             (
-                "format_tags:stream=index,codec_type,codec_name,disposition:stream_tags="
+                # Dispositions must be requested as their own section; "stream=disposition" returns nothing.
+                "format_tags:stream=index,codec_type,codec_name"
+                ":stream_disposition=default,forced,attached_pic:stream_tags="
                 "language,title,filename,mimetype,handler_name,vendor_id"
             ),
             "-of",
@@ -82,6 +93,20 @@ def collect_metadata(ffprobe_bin: str, media_path: Path) -> EntryMetadata:
         elif stream_type == "audio" and metadata.audio_index is None:
             metadata.audio_index = stream["index"]
             metadata.audio_language = tags.get("language")
+        elif stream_type == "subtitle":
+            codec_name = stream.get("codec_name")
+            if codec_name in IMAGE_SUBTITLE_CODECS:
+                continue
+            metadata.subtitle_streams.append(
+                SubtitleStream(
+                    index=stream["index"],
+                    codec=codec_name,
+                    language=tags.get("language") or None,
+                    title=tags.get("title") or None,
+                    default=bool(disposition.get("default")),
+                    forced=bool(disposition.get("forced")),
+                )
+            )
 
     if metadata.video_index is None:
         raise ConversionError("no primary video stream found")
@@ -375,6 +400,94 @@ def choose_cover(
 
 def cover_output_path_for_job(job: Job) -> Path:
     return job.output_file.with_suffix(".webp")
+
+
+def subtitle_language_token(language: str | None) -> str:
+    token = re.sub(r"[^A-Za-z0-9-]+", "", language or "")
+    return token or "und"
+
+
+def subtitle_output_path(output_file: Path, position: int, language: str | None) -> Path:
+    return output_file.with_name(f"{output_file.stem}.{position}.{subtitle_language_token(language)}.vtt")
+
+
+def existing_subtitle_sidecars(output_file: Path) -> list[Path]:
+    if not output_file.parent.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(output_file.stem)}\.\d+\.[A-Za-z0-9-]+\.vtt$")
+    return sorted(path for path in output_file.parent.iterdir() if path.is_file() and pattern.match(path.name))
+
+
+def remove_subtitle_sidecars(output_file: Path) -> None:
+    for path in existing_subtitle_sidecars(output_file):
+        path.unlink(missing_ok=True)
+
+
+def subtitle_label(stream: SubtitleStream, position: int) -> str:
+    if stream.title:
+        return stream.title
+    if stream.language and stream.language != "und":
+        return stream.language
+    return f"Subtitle {position + 1}"
+
+
+def expected_subtitle_sidecars(output_file: Path, streams: list[SubtitleStream]) -> list[dict[str, Any]]:
+    """Describe the .vtt sidecars for an output; `path` is absolute and must be made relative by the caller."""
+    return [
+        {
+            "path": subtitle_output_path(output_file, position, stream.language),
+            "language": subtitle_language_token(stream.language),
+            "label": subtitle_label(stream, position),
+            "default": stream.default,
+            "forced": stream.forced,
+        }
+        for position, stream in enumerate(streams)
+    ]
+
+
+def extract_subtitle_sidecars(
+    ffmpeg_bin: str,
+    source_video: Path,
+    streams: list[SubtitleStream],
+    output_file: Path,
+) -> list[dict[str, Any]]:
+    """Write every text subtitle stream as a WebVTT sidecar next to `output_file`.
+
+    WebVTT streams (what yt-dlp embeds from YouTube) are copied verbatim so cue
+    positioning survives; other text formats are converted to WebVTT.
+    Stale sidecars from an earlier run are removed first.
+    """
+    remove_subtitle_sidecars(output_file)
+    sidecars = expected_subtitle_sidecars(output_file, streams)
+    if not sidecars:
+        return []
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg_bin, "-y", "-v", "error", "-i", str(source_video)]
+    for stream, sidecar in zip(streams, sidecars):
+        codec = "copy" if stream.codec == "webvtt" else "webvtt"
+        cmd.extend(["-map", f"0:{stream.index}", "-c:s", codec, "-f", "webvtt", str(sidecar["path"])])
+    try:
+        run_command(cmd)
+    except BaseException:
+        remove_subtitle_sidecars(output_file)
+        raise
+    return sidecars
+
+
+def extract_source_subtitles(
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    source_video: Path,
+    output_file: Path,
+) -> list[dict[str, Any]]:
+    """Probe the source and write its subtitle sidecars (used to backfill already-converted outputs)."""
+    try:
+        metadata = collect_metadata(ffprobe_bin, source_video)
+        return extract_subtitle_sidecars(ffmpeg_bin, source_video, metadata.subtitle_streams, output_file)
+    except subprocess.CalledProcessError as exc:
+        message = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
+        raise ConversionError(f"subtitle extraction failed for {source_video}: {message}") from exc
 
 
 def write_cover_sidecar(

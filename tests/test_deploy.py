@@ -81,6 +81,7 @@ class DeployTests:
         (self.archive / 'Shots' / '[Creator] Shot').mkdir(parents=True)
         (self.archive / 'Shots' / '[Creator] Shot' / '1.mkv').write_text('source', encoding='utf-8')
         self.remote_root = 'test:Abridged'
+        self.fake_subtitle_languages: list[str] = []
 
     def teardown_method(self) -> None:
         self.temp_dir.cleanup()
@@ -114,7 +115,7 @@ class DeployTests:
         source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
         output_key = 'Shots/[Creator] Shot/1.mp4'
         cover_key = 'Shots/[Creator] Shot/1.webp'
-        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'description': 'remote', 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'description': 'remote', 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}}}
         rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
         with self._patched_deploy(rclone) as convert_job:
             exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
@@ -133,7 +134,7 @@ class DeployTests:
         output_key = 'Shots/[Creator] Shot/1.mp4'
         cover_key = 'Shots/[Creator] Shot/1.webp'
         source_match = {'path': 'Shots/[Creator] Shot/1.mkv', 'size': source.stat().st_size, 'modTimeUnixNano': -1}
-        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_match, 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_match, 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}}}
         rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
         with self._patched_deploy(rclone) as convert_job:
             exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
@@ -145,7 +146,7 @@ class DeployTests:
         source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
         output_key = 'Shots/[Creator] Shot/1.mp4'
         cover_key = 'Shots/[Creator] Shot/1.webp'
-        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}}}
         rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
 
         with self._patched_deploy(rclone) as convert_job:
@@ -160,7 +161,7 @@ class DeployTests:
     def test_rename_uploads_new_path_and_deletes_old_remote_path(self) -> None:
         old_output = 'Shots/[Creator] Old Shot/1.mp4'
         old_cover = 'Shots/[Creator] Old Shot/1.webp'
-        old_metadata = {'version': 2, 'items': {old_output: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': {'path': 'Shots/[Creator] Old Shot/1.mkv', 'size': 6, 'modTimeUnixNano': 1}, 'outputPath': old_output, 'coverPath': old_cover, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        old_metadata = {'version': 2, 'items': {old_output: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': {'path': 'Shots/[Creator] Old Shot/1.mkv', 'size': 6, 'modTimeUnixNano': 1}, 'outputPath': old_output, 'coverPath': old_cover, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}}}
         rclone = FakeRclone(self.remote_root, {old_output: b'old video', old_cover: b'old cover', METADATA_CACHE_FILENAME: json.dumps(old_metadata).encode('utf-8')})
         with self._patched_deploy(rclone):
             exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
@@ -179,7 +180,7 @@ class DeployTests:
         old_cover = 'Shots/[Creator] Old Shot/1.webp'
         song_output = 'Songs/[Singer] Song/1.mp4'
         song_cover = 'Songs/[Singer] Song/1.webp'
-        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}, old_output: {'size': 111, 'modTimeUnixNano': 222, 'durationSeconds': 3, 'source': {'path': 'Shots/[Creator] Old Shot/1.mkv', 'size': 6, 'modTimeUnixNano': 1}, 'outputPath': old_output, 'coverPath': old_cover, 'deployedAt': '2024-01-01T00:00:00+00:00'}, song_output: {'size': 333, 'modTimeUnixNano': 444, 'durationSeconds': 9, 'source': {'path': 'Songs/[Singer] Song/1.mkv', 'size': 8, 'modTimeUnixNano': 2}, 'outputPath': song_output, 'coverPath': song_cover, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}, old_output: {'size': 111, 'modTimeUnixNano': 222, 'durationSeconds': 3, 'source': {'path': 'Shots/[Creator] Old Shot/1.mkv', 'size': 6, 'modTimeUnixNano': 1}, 'outputPath': old_output, 'coverPath': old_cover, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}, song_output: {'size': 333, 'modTimeUnixNano': 444, 'durationSeconds': 9, 'source': {'path': 'Songs/[Singer] Song/1.mkv', 'size': 8, 'modTimeUnixNano': 2}, 'outputPath': song_output, 'coverPath': song_cover, 'deployedAt': '2024-01-01T00:00:00+00:00', 'subtitles': []}}}
         rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', old_output: b'old video', old_cover: b'old cover', song_output: b'song video', song_cover: b'song cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
         with self._patched_deploy(rclone) as convert_job:
             exit_code = main([str(self.archive), str(self.stage), '--category', 'Shots', '--deploy', self.remote_root])
@@ -245,7 +246,7 @@ class DeployTests:
     def test_bootstrap_deploy_generates_local_metadata_and_state_without_conversion(self) -> None:
         self._write_existing_outputs()
         with mock.patch('abridged_convert.app.convert_job') as convert_job:
-            with mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}):
+            with mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}), mock.patch('abridged_convert.deploy.extract_source_subtitles', return_value=[]):
                 exit_code = main([str(self.archive), str(self.stage), '--bootstrap-deploy'])
         assert exit_code == 0
         convert_job.assert_not_called()
@@ -259,7 +260,7 @@ class DeployTests:
         self._write_existing_outputs()
         rclone = FakeRclone(self.remote_root, {'Shots/[Creator] Old Shot/1.mp4': b'old video', 'Shots/[Creator] Old Shot/1.webp': b'old cover'})
         with self._patched_rclone(rclone):
-            with mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}):
+            with mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}), mock.patch('abridged_convert.deploy.extract_source_subtitles', return_value=[]):
                 exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--bootstrap-deploy'])
         assert exit_code == 0
         assert not self.stage.exists()
@@ -267,6 +268,62 @@ class DeployTests:
         assert 'Shots/[Creator] Shot/1.webp' in rclone.files
         assert METADATA_CACHE_FILENAME in rclone.files
         assert sorted(rclone.deleted_paths()) == ['Shots/[Creator] Old Shot/1.mp4', 'Shots/[Creator] Old Shot/1.webp']
+
+    def test_deploy_uploads_subtitle_sidecars_and_lists_them(self) -> None:
+        self.fake_subtitle_languages = ['en', 'es']
+        rclone = FakeRclone(self.remote_root)
+        with self._patched_deploy(rclone):
+            exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
+        assert exit_code == 0
+        assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
+        assert 'Shots/[Creator] Shot/1.1.es.vtt' in rclone.files
+        item = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))['items']['Shots/[Creator] Shot/1.mp4']
+        assert [entry['path'] for entry in item['subtitles']] == ['Shots/[Creator] Shot/1.0.en.vtt', 'Shots/[Creator] Shot/1.1.es.vtt']
+        assert item['subtitles'][0]['default'] is True
+
+    def test_deploy_backfills_subtitles_without_reuploading_video(self) -> None:
+        self.fake_subtitle_languages = ['en']
+        source = self.archive / 'Shots' / '[Creator] Shot' / '1.mkv'
+        output_key = 'Shots/[Creator] Shot/1.mp4'
+        cover_key = 'Shots/[Creator] Shot/1.webp'
+        metadata = {'version': 2, 'items': {output_key: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': source_signature(self.archive, source), 'outputPath': output_key, 'coverPath': cover_key, 'deployedAt': '2024-01-01T00:00:00+00:00'}}}
+        rclone = FakeRclone(self.remote_root, {output_key: b'remote video', cover_key: b'remote cover', METADATA_CACHE_FILENAME: json.dumps(metadata).encode('utf-8')})
+        with self._patched_deploy(rclone) as convert_job:
+            exit_code = main([str(self.archive), str(self.stage), '--deploy', self.remote_root])
+        assert exit_code == 0
+        convert_job.assert_not_called()
+        assert rclone.uploaded_media_paths() == ['Shots/[Creator] Shot/1.0.en.vtt']
+        assert rclone.files[output_key] == b'remote video'
+        item = json.loads(rclone.files[METADATA_CACHE_FILENAME].decode('utf-8'))['items'][output_key]
+        assert item['subtitles'][0]['path'] == 'Shots/[Creator] Shot/1.0.en.vtt'
+        assert item['deployedAt'] == '2024-01-01T00:00:00+00:00'
+        assert item['size'] == 123
+        with self._patched_deploy(rclone) as second_convert_job:
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
+        second_convert_job.assert_not_called()
+        self.extract_source_subtitles.assert_not_called()
+
+    def test_redeploy_with_fewer_subtitles_deletes_stale_remote_sidecar(self) -> None:
+        self.fake_subtitle_languages = ['en', 'es']
+        rclone = FakeRclone(self.remote_root)
+        with self._patched_deploy(rclone):
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
+        self.fake_subtitle_languages = ['en']
+        with self._patched_deploy(rclone):
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root, '--overwrite']) == 0
+        assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
+        assert 'Shots/[Creator] Shot/1.1.es.vtt' not in rclone.files
+
+    def test_pruned_item_deletes_its_remote_subtitles(self) -> None:
+        old_output = 'Shots/[Creator] Old Shot/1.mp4'
+        old_cover = 'Shots/[Creator] Old Shot/1.webp'
+        old_sub = 'Shots/[Creator] Old Shot/1.0.en.vtt'
+        old_metadata = {'version': 2, 'items': {old_output: {'size': 123, 'modTimeUnixNano': 456, 'durationSeconds': 7, 'source': {'path': 'Shots/[Creator] Old Shot/1.mkv', 'size': 6, 'modTimeUnixNano': 1}, 'outputPath': old_output, 'coverPath': old_cover, 'subtitles': [{'path': old_sub, 'language': 'en', 'label': 'en', 'default': True, 'forced': False}]}}}
+        rclone = FakeRclone(self.remote_root, {old_output: b'old video', old_cover: b'old cover', old_sub: b'WEBVTT', METADATA_CACHE_FILENAME: json.dumps(old_metadata).encode('utf-8')})
+        with self._patched_deploy(rclone):
+            assert main([str(self.archive), str(self.stage), '--deploy', self.remote_root]) == 0
+        assert old_sub not in rclone.files
+        assert old_sub in rclone.deleted_paths()
 
     def test_rejects_unsafe_remote_relative_paths(self) -> None:
         with pytest.raises(Exception, match='unsafe remote relative path'):
@@ -283,7 +340,8 @@ class DeployTests:
             job.output_file.parent.mkdir(parents=True, exist_ok=True)
             job.output_file.write_bytes(b'converted video')
             job.output_file.with_suffix('.webp').write_bytes(b'converted cover')
-            return ConversionResult(category=job.category, entry_dir=job.entry_dir, source_video=job.source_video, output_file=job.output_file, success=True, cover_source='external:cover.png', message='converted')
+            subtitles = self._write_fake_subtitles(job.output_file)
+            return ConversionResult(category=job.category, entry_dir=job.entry_dir, source_video=job.source_video, output_file=job.output_file, success=True, cover_source='external:cover.png', subtitles=subtitles, message='converted')
         convert_job = mock.Mock(side_effect=fake_convert_job)
         with ExitStack() as stack:
             stack.enter_context(mock.patch('abridged_convert.app.convert_job', convert_job))
@@ -291,6 +349,7 @@ class DeployTests:
             stack.enter_context(self._patched_rclone(rclone))
             stack.enter_context(mock.patch('abridged_convert.deploy.build_metadata_cache_item', return_value={'size': 15, 'modTimeUnixNano': 20, 'durationSeconds': 1}))
             stack.enter_context(mock.patch('abridged_convert.metadata.probe_video_metadata', return_value={'durationSeconds': 1}))
+            self.extract_source_subtitles = stack.enter_context(mock.patch('abridged_convert.deploy.extract_source_subtitles', side_effect=self._fake_extract_source_subtitles))
             yield convert_job
 
     @contextmanager
@@ -299,6 +358,18 @@ class DeployTests:
             stack.enter_context(mock.patch('abridged_convert.deploy.run_rclone', side_effect=rclone))
             stack.enter_context(mock.patch('abridged_convert.deploy.run_rclone_progress', side_effect=rclone))
             yield
+
+    def _write_fake_subtitles(self, output_file: Path) -> list[dict]:
+        sidecars = []
+        for position, language in enumerate(self.fake_subtitle_languages):
+            path = output_file.with_name(f'{output_file.stem}.{position}.{language}.vtt')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('WEBVTT\n', encoding='utf-8')
+            sidecars.append({'path': path, 'language': language, 'label': language, 'default': position == 0, 'forced': False})
+        return sidecars
+
+    def _fake_extract_source_subtitles(self, _ffmpeg_bin, _ffprobe_bin, _source_video, output_file):
+        return self._write_fake_subtitles(output_file)
 
     def _write_existing_outputs(self) -> None:
         output_dir = self.stage / 'Shots' / '[Creator] Shot'

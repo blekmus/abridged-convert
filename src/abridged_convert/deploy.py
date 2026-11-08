@@ -4,22 +4,25 @@ import os
 import shutil
 import subprocess
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 from abridged_convert.common import normalize_categories, path_is_in_categories, source_signature
 from abridged_convert.constants import CATEGORY_ORDER
-from abridged_convert.media import cover_output_path_for_job
+from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles
 from abridged_convert.metadata import (
     DEPLOY_RUN_SIGNATURE_KEY,
     DEPLOY_RUN_STATUS_IN_PROGRESS,
     DEPLOY_RUN_STATUS_KEY,
     ITEM_UPLOAD_PENDING_KEY,
     METADATA_CACHE_FILENAME,
+    SUBTITLES_KEY,
     build_metadata_cache_item,
     deploy_state_from_metadata_item,
+    item_subtitle_paths,
+    subtitle_metadata_entries,
     load_cache_document,
     load_cache_deploy_items,
     load_cache_items,
@@ -41,6 +44,8 @@ class DeployJobPlan:
     needs_conversion: bool
     reason: str
     staged_metadata_item: dict[str, Any] | None = None
+    # Remote video is current but its subtitle sidecars were never extracted (one-time backfill).
+    subtitles_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,8 @@ class DeployContext:
     deploy_run_signature: str
     resumed: bool
     dangling_paths: tuple[str, ...] = ()
+    # Remote files replaced by a re-conversion that produced fewer/different subtitle sidecars.
+    stale_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,7 @@ def bootstrap_deploy_from_existing_outputs(
     jobs: list[Job],
     prune_categories: Iterable[str],
     ffprobe_bin: str,
+    ffmpeg_bin: str = "ffmpeg",
     dry_run: bool,
     keep_staging: bool,
     log: DeployLogger | None = None,
@@ -126,12 +134,17 @@ def bootstrap_deploy_from_existing_outputs(
             )
             if item is None:
                 raise ConversionError(f"failed to probe metadata for bootstrap output: {plan.job.output_file}")
+            emit(log, f"extracting subtitles {index}/{len(plans)}: {plan.output_key}")
+            sidecars = extract_source_subtitles(ffmpeg_bin, ffprobe_bin, plan.job.source_video, plan.job.output_file)
+            item[SUBTITLES_KEY] = subtitle_metadata_entries(resolved_staging, sidecars)
             metadata_items[plan.output_key] = item
             deploy_items[plan.output_key] = deploy_item
         uploaded_paths.extend([plan.output_key, plan.cover_key])
+        if plan.output_key in metadata_items:
+            uploaded_paths.extend(subtitle_keys(metadata_items[plan.output_key]))
 
     prune_scope = normalize_categories(prune_categories)
-    expected_files = expected_remote_files(plans)
+    expected_files = expected_remote_files(plans) | set(uploaded_paths)
     remote_files: set[str] = set()
     safe_remote_root = None
     if remote_root is not None:
@@ -301,14 +314,20 @@ def build_deploy_plans(
         reason = "remote unchanged"
         changed = False
         needs_conversion = False
+        subtitles_only = False
         if force:
             changed = True
             needs_conversion = True
             reason = "overwrite requested"
         elif pending_upload:
             changed = True
-            needs_conversion = not pending_output_files_ready(job)
+            needs_conversion = not pending_output_files_ready(job, matched_item)
             reason = "pending upload" if not needs_conversion else "pending output missing"
+        elif matched_item is not None and SUBTITLES_KEY not in matched_item:
+            changed = True
+            needs_conversion = False
+            subtitles_only = True
+            reason = "subtitles missing"
         elif matched_item is not None:
             changed = False
             needs_conversion = False
@@ -340,6 +359,7 @@ def build_deploy_plans(
                 needs_conversion=needs_conversion,
                 reason=reason,
                 staged_metadata_item=staged_item if staged_ready else None,
+                subtitles_only=subtitles_only,
             )
         )
     return plans
@@ -385,6 +405,10 @@ def metadata_output_key(metadata_key: str | None, item: dict[str, Any]) -> str:
     return validate_remote_relpath(metadata_key)
 
 
+def subtitle_keys(item: dict[str, Any]) -> list[str]:
+    return [validate_remote_relpath(path) for path in item_subtitle_paths(item)]
+
+
 def metadata_cover_key(output_key: str, item: dict[str, Any]) -> str:
     cover_path = item.get("coverPath")
     if isinstance(cover_path, str):
@@ -419,6 +443,7 @@ def dangling_paths_from_metadata(
         cover_key = metadata_cover_key(output_key, item)
         dangling.add(output_key)
         dangling.add(cover_key)
+        dangling.update(subtitle_keys(item))
     return tuple(sorted(dangling))
 
 
@@ -445,9 +470,11 @@ def finalize_deploy(
     changed_plans = [plan for plan in context.plans if plan.changed]
     metadata_changed = bool(changed_plans or context.dangling_paths or context.resumed)
     if dry_run:
+        # Subtitle sidecar names are only known after extraction, so dry runs list video and cover only.
         upload_paths = [
             relpath
             for plan in changed_plans
+            if not plan.subtitles_only
             for relpath in (plan.output_key, plan.cover_key)
         ]
         if metadata_changed:
@@ -464,15 +491,17 @@ def finalize_deploy(
 
     for index, plan in enumerate(context.plans, start=1):
         # Only uploaded items get this run's timestamp; skipped items keep their existing deployedAt.
-        deploy_item = deploy_tracking_item(plan, deployed_at=now if plan.changed else None)
+        video_uploaded = plan.changed and not plan.subtitles_only
+        deploy_item = deploy_tracking_item(plan, deployed_at=now if video_uploaded else None)
         if plan.changed:
             item = context.metadata_items.get(plan.output_key)
             if item is None:
                 raise ConversionError(f"deploy metadata is missing changed output: {plan.output_key}")
             if item.get(ITEM_UPLOAD_PENDING_KEY) is False:
                 emit(log, f"uploading pending item {len(uploaded_paths) // 2 + 1}/{len(changed_plans)}: {plan.output_key}")
-                upload_remote_files(rclone_bin, context.remote_root, context.staging_root, [plan.output_key, plan.cover_key], log=log)
-                uploaded_paths.extend([plan.output_key, plan.cover_key])
+                item_paths = [plan.output_key, plan.cover_key, *subtitle_keys(item)]
+                upload_remote_files(rclone_bin, context.remote_root, context.staging_root, item_paths, log=log)
+                uploaded_paths.extend(item_paths)
                 item.pop(ITEM_UPLOAD_PENDING_KEY, None)
                 context.metadata_items[plan.output_key] = item
                 write_deploy_journal(
@@ -519,7 +548,17 @@ def finalize_deploy(
     else:
         emit(log, f"skipping {METADATA_CACHE_FILENAME}: unchanged")
 
+    expected_after = {
+        path
+        for key, item in next_metadata_items.items()
+        for path in (metadata_output_key(key, item), *subtitle_keys(item))
+    }
     delete_remote_files(rclone_bin, context.remote_root, list(context.dangling_paths), log=log)
+    # Stale subtitle sidecars sit beside a still-deployed video, so their directories are never removed.
+    stale = sorted(set(context.stale_paths) - expected_after - set(context.dangling_paths))
+    for index, relpath in enumerate(stale, start=1):
+        emit(log, f"deleting stale subtitle {index}/{len(stale)}: {relpath}")
+        delete_remote_file(rclone_bin, context.remote_root, relpath)
 
     if not keep_staging:
         emit(log, f"cleaning staging directory: {context.staging_root}")
@@ -542,6 +581,8 @@ def expected_remote_files(plans: list[DeployJobPlan]) -> set[str]:
     for plan in plans:
         expected.add(plan.output_key)
         expected.add(plan.cover_key)
+        if plan.staged_metadata_item is not None:
+            expected.update(subtitle_keys(plan.staged_metadata_item))
     return expected
 
 
@@ -584,7 +625,9 @@ def record_pending_deploy_item(
     plan: DeployJobPlan,
     *,
     ffprobe_bin: str,
+    subtitles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    previous_item = context.metadata_items.get(plan.output_key) or {}
     deploy_item = pending_deploy_tracking_item(plan)
     item = build_metadata_cache_item(
         plan.job.output_file,
@@ -594,6 +637,8 @@ def record_pending_deploy_item(
     if item is None:
         raise ConversionError(f"failed to probe metadata for staged output: {plan.job.output_file}")
     item.update(deploy_item)
+    item[SUBTITLES_KEY] = subtitle_metadata_entries(context.staging_root, subtitles or [])
+    context.stale_paths.extend(set(subtitle_keys(previous_item)) - set(subtitle_keys(item)))
     context.metadata_items[plan.output_key] = item
     deploy_state = deploy_state_from_metadata_item(item)
     if deploy_state is not None:
@@ -605,6 +650,35 @@ def record_pending_deploy_item(
         metadata_upload_pending=True,
     )
     return item
+
+
+def backfill_subtitles(
+    rclone_bin: str,
+    context: DeployContext,
+    plan: DeployJobPlan,
+    *,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    log: DeployLogger | None = None,
+) -> list[str]:
+    """Extract and upload subtitle sidecars for an already-deployed video without touching the video itself."""
+    item = context.metadata_items.get(plan.output_key)
+    if item is None:
+        raise ConversionError(f"deploy metadata is missing backfill output: {plan.output_key}")
+    sidecars = extract_source_subtitles(ffmpeg_bin, ffprobe_bin, plan.job.source_video, plan.job.output_file)
+    entries = subtitle_metadata_entries(context.staging_root, sidecars)
+    next_item = {**item, SUBTITLES_KEY: entries}
+    keys = subtitle_keys(next_item)
+    if keys:
+        upload_remote_files(rclone_bin, context.remote_root, context.staging_root, keys, log=log)
+    context.metadata_items[plan.output_key] = next_item
+    write_deploy_journal(
+        context.metadata_path,
+        context.metadata_items,
+        deploy_run_signature=context.deploy_run_signature,
+        metadata_upload_pending=True,
+    )
+    return keys
 
 
 def log_dry_run_remote_actions(
@@ -635,14 +709,21 @@ def staged_output_is_ready(
         return False
     if staged_state.get("outputPath") != output_key or staged_state.get("coverPath") != cover_key:
         return False
-    if not job.output_file.is_file() or not cover_output_path_for_job(job).is_file():
+    if not pending_output_files_ready(job, staged_item):
         return False
     stat = job.output_file.stat()
     return staged_item.get("size") == stat.st_size and staged_item.get("modTimeUnixNano") == stat.st_mtime_ns
 
 
-def pending_output_files_ready(job: Job) -> bool:
-    return job.output_file.is_file() and cover_output_path_for_job(job).is_file()
+def pending_output_files_ready(job: Job, item: dict[str, Any] | None = None) -> bool:
+    if not job.output_file.is_file() or not cover_output_path_for_job(job).is_file():
+        return False
+    if item is None or not isinstance(item.get("outputPath"), str):
+        return True
+    # Subtitle paths are relative to the staging root; walk up from the output by its key depth.
+    output_depth = len(PurePosixPath(item["outputPath"]).parts)
+    staging_root = job.output_file.parents[output_depth - 1]
+    return all((staging_root / Path(path)).is_file() for path in item_subtitle_paths(item))
 
 
 def dangling_remote_files(

@@ -8,6 +8,16 @@ class ConversionError(RuntimeError):
     """Raised when conversion setup or an entry is invalid."""
 
 
+@dataclass(frozen=True)
+class SubtitleStream:
+    index: int
+    codec: str | None
+    language: str | None = None
+    title: str | None = None
+    default: bool = False
+    forced: bool = False
+
+
 @dataclass
 class EntryMetadata:
     tags: dict[str, str] = field(default_factory=dict)
@@ -17,6 +27,7 @@ class EntryMetadata:
     attached_cover_codec: str | None = None
     video_language: str | None = None
     audio_language: str | None = None
+    subtitle_streams: list[SubtitleStream] = field(default_factory=list)
 
 
 @dataclass
@@ -39,6 +50,9 @@ class ConversionResult:
     success: bool = False
     skipped: bool = False
     cover_source: str | None = None
+    # Subtitle sidecars written for this output: {path (absolute), language, label, default, forced}.
+    # None means subtitles were not processed (e.g. dry run).
+    subtitles: list[dict] | None = None
     mapped_tags: list[str] = field(default_factory=list)
     message: str = ""
 
