@@ -10,14 +10,46 @@ uv tool install -e ./abridged-convert
 
 That gives you an `abridged-convert` executable you can run from anywhere.
 
-Default behavior:
+Run `abridged-convert --help` (or `abridged-convert <command> --help`) for the same examples shown here. Help is coloured in a terminal; set `NO_COLOR=1` to turn that off, or `FORCE_COLOR=1` to keep colour when piping (e.g. into `less -R`).
 
-- if `INPUT_DIR` contains `Series`, `Shots`, `Shorts`, and/or `Songs`, it reads every category it finds there
-- if `INPUT_DIR` is one category directory such as `Series`, it only reads that category
-- writes to `OUTPUT_DIR/Series`, `OUTPUT_DIR/Shots`, `OUTPUT_DIR/Shorts`, and `OUTPUT_DIR/Songs`
-- maps `Songs/[~] AMVs/*.mkv` to `OUTPUT_DIR/Songs/AMV/<entry>/1.mp4` or `1.webm` with matched covers from `Songs/[~] AMVs/covers`
+## Commands
+
+```bash
+# Convert the whole archive into Web/
+abridged-convert convert abridged Web
+
+# Only one category (repeat --category for more; any case works)
+abridged-convert convert abridged Web --category Series
+
+# Only one entry: tab-complete the real path (repeat --entry for more)
+abridged-convert convert abridged Web --entry "abridged/Series/[Creator] Show"
+abridged-convert convert abridged Web --entry "abridged/Songs/[~] AMVs/[Creator] Song.mkv"
+
+# Preview a deploy, then run it
+abridged-convert deploy abridged bitpile:Abridged --dry-run
+abridged-convert deploy abridged bitpile:Abridged
+# Interrupted? Run the same command again to resume.
+
+# Recovery only: Web/ has videos but .abridged-video-metadata.json is gone
+abridged-convert rebuild-metadata abridged Web --upload bitpile:Abridged
+```
+
+Path rules. There is exactly one accepted form:
+
+- `ARCHIVE` is always the folder that contains `Series/`, `Shots/`, `Shorts/` and `Songs/`, never a category folder such as `abridged/Series`.
+- `OUTPUT` (for `convert` and `rebuild-metadata`) is always the web root, never `Web/Series`. Category folders are created inside it.
+- Narrow a run with `--category Series|Shots|Shorts|Songs` or `--entry PATH`, never with a deeper path. A category-level path is rejected with the corrected command.
+- `--entry` takes an entry folder `ARCHIVE/<Category>/<entry>` or an AMV file `ARCHIVE/Songs/[~] AMVs/<file>`.
+- A run owns its scope: inside the selected categories or entries, anything that no longer exists in the archive is pruned. Nothing outside the scope is touched.
+
+The ffmpeg, ffprobe and rclone paths can be overridden with `--ffmpeg`, `--ffprobe` and `--rclone`, listed under "advanced" in each command's help.
+
+## What `convert` produces
+
+- writes to `OUTPUT/Series`, `OUTPUT/Shots`, `OUTPUT/Shorts`, and `OUTPUT/Songs`
+- maps `Songs/[~] AMVs/*.mkv` to `OUTPUT/Songs/AMV/<entry>/1.mp4` or `1.webm` with matched covers from `Songs/[~] AMVs/covers`
 - preserves metadata
-- writes `OUTPUT_DIR/.abridged-video-metadata.json` after conversion for the web catalog
+- writes `OUTPUT/.abridged-video-metadata.json` after conversion for the web catalog
 - prefers discovered cover image files first, then embedded cover art, otherwise generates a thumbnail from the video at the 20 second mark, falling back to the first frame for shorter videos
 - writes the chosen or generated cover beside each output video as a `.webp` sidecar, copying existing WebP covers directly and converting other formats losslessly when possible
 - copies/remuxes existing video and audio streams by default without re-encoding
@@ -31,39 +63,33 @@ Default behavior:
 
   `label` is the track title when the source has one, otherwise the language. An empty list means the source has no subtitles. A missing `subtitles` key means the entry was converted before subtitle support existed: local runs and deploys backfill it once from the source, extracting and uploading only the `.vtt` files without re-converting or re-uploading the video.
 
-Usage:
-
-```bash
-abridged-convert . Web
-abridged-convert . Web --overwrite
-abridged-convert . Web --dry-run
-abridged-convert ./Series ./Web
-```
-
 By default, compatible video/audio streams are copied without re-encoding. Outputs are
 always `.mp4` or `.webm`, never `.mkv`, and covers are written as sibling `.webp` files
 rather than embedded into the video. If a source's streams do not fit either supported
 container, `abridged-convert` transcodes to MP4, preferring NVIDIA NVENC when available
 and falling back to CPU/libx264.
 
-Deploy mode:
+## How `deploy` works
 
-```bash
-abridged-convert Archive Web --deploy bitpile:Abridged
-abridged-convert Archive Web --deploy bitpile:Abridged --deploy-dry-run
-abridged-convert Archive Web --deploy bitpile:Abridged --keep-staging
-abridged-convert Archive Web --bootstrap-deploy
-abridged-convert Archive Web --deploy bitpile:Abridged --bootstrap-deploy
-```
+`deploy ARCHIVE REMOTE` stages converted files in a fresh temp dir
+(`/tmp/abridged-deploy-*`; set `TMPDIR` to move it) and leaves nothing behind
+after a successful run.
 
-Deploy mode treats `OUTPUT_DIR` as temporary staging. It downloads the remote
-`.abridged-video-metadata.json` and treats that metadata as the source of truth
-for already-uploaded files. Unchanged entries are matched by the recorded
+While a run is unfinished, `ARCHIVE/.abridged-deploy.json` records the remote
+and the temp dir. Running the same command again resumes from there. If the temp
+dir is gone (e.g. after a reboot), or the file names a different remote, the run
+starts again from the remote metadata. Anything uploaded but not yet listed in
+the remote catalog is re-converted and re-uploaded to the same paths. A failed
+or interrupted run keeps both so it can resume; a successful run removes both.
+Dry runs never write the file.
+
+Deploy downloads the remote `.abridged-video-metadata.json` and treats it as
+the source of truth for already-uploaded files. Unchanged entries are matched by the recorded
 `source.path` and `source.size`, so deploy startup does not `ffprobe` every file
 in the selected archive tree. `ffprobe` is only run for entries that are new,
 changed, forced with `--overwrite`, or missing staged output during resume.
 
-Deploy uses a resumable local journal in `OUTPUT_DIR/.abridged-video-metadata.json`.
+The resume journal is `.abridged-video-metadata.json` inside the temp staging dir.
 A clean deploy creates a `deployRunSignature`; if the run is interrupted, the
 next run sees the in-progress signature and resumes from the local journal
 instead of downloading the remote metadata again. Successfully converted entries
@@ -72,6 +98,13 @@ During upload, that marker is cleared only after both the video and cover are
 uploaded. Local-only journal fields are stripped from the remote metadata, while
 `deployRunSignature` is kept as the run identifier.
 
+Every deploy also lists the remote and deletes files inside its scope that the
+catalog no longer references, such as leftovers from a run that died between
+uploading the catalog and deleting old files. Only files inside category folders
+are considered, never other files at the remote root. If most of the remote
+looks orphaned, deploy deletes nothing and prints a warning instead, because
+that points to a broken catalog rather than stray files.
+
 When there are no changed entries and no dangling remote entries to prune,
 deploy skips uploading the metadata file because the remote metadata would be
 unchanged. When entries are pruned, deploy deletes the recorded remote
@@ -79,7 +112,11 @@ unchanged. When entries are pruned, deploy deletes the recorded remote
 rclone remote must point at the dedicated catalog folder, not a shared parent
 directory.
 
-Use `--bootstrap-deploy` when `OUTPUT_DIR` already contains the converted MP4
-and WebP files but the root `.abridged-video-metadata.json` file does not exist
-yet. With `--deploy`, the bootstrap run uploads the existing outputs and
-generated metadata without re-encoding.
+## Recovery: `rebuild-metadata`
+
+Use `rebuild-metadata ARCHIVE OUTPUT` only when `OUTPUT` already contains the
+converted videos and WebP covers but the root `.abridged-video-metadata.json`
+is missing, e.g. after losing the remote catalog's metadata. It rebuilds the
+file from the existing outputs without re-encoding. With `--upload REMOTE` it
+also uploads the outputs and the rebuilt metadata. `OUTPUT` is always kept,
+since in a recovery it is the only copy of the converted files.

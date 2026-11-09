@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
-from dataclasses import replace
+import tempfile
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -15,12 +18,15 @@ from abridged_convert.deploy import (
     DeploySummary,
     backfill_subtitles,
     bootstrap_deploy_from_existing_outputs,
+    clean_staging,
+    validate_remote_root,
     finalize_deploy,
     prepare_deploy_context,
     record_pending_deploy_item,
     relative_output_key,
 )
 from abridged_convert.discovery import discover_jobs, resolve_input_roots
+from abridged_convert.help_format import ColorArgumentParser
 from abridged_convert.media import cover_output_path_for_job, resolve_video_handling_plan, validate_tools
 from abridged_convert.metadata import (
     SUBTITLES_KEY,
@@ -30,115 +36,265 @@ from abridged_convert.metadata import (
     subtitle_metadata_entries,
     update_metadata_cache_item_with_tracking,
 )
-from abridged_convert.models import ConversionError, ConversionResult, VideoEncodingConfig
+from abridged_convert.models import ConversionError, ConversionResult, Job, VideoEncodingConfig
 from abridged_convert.ui import TerminalUI
 
 
-CLI_DESCRIPTION = "Convert entries from the abridged archive layout into mirrored web outputs."
+PROG = "abridged-convert"
+DEPLOY_POINTER_FILENAME = ".abridged-deploy.json"
+STAGING_PREFIX = "abridged-deploy-"
+AMV_DIR_NAME = "[~] AMVs"
+
+PATH_RULES = """\
+paths:
+  ARCHIVE    = folder containing Series/ Shots/ Shorts/ Songs/   (not abridged/Series)
+  OUTPUT     = web root, category folders go inside it           (not Web/Series)
+  categories = Series, Shots, Shorts, Songs (any case)
+  Narrow a run with --category / --entry, never with a deeper path.
+  A run only adds, replaces, or prunes items inside its categories/entries."""
+
+CONVERT_EXAMPLES = """\
+  # Convert the whole archive into Web/
+  abridged-convert convert abridged Web
+
+  # Only one category (repeat --category for more)
+  abridged-convert convert abridged Web --category Series
+
+  # Only one entry: tab-complete the real path (repeat --entry for more)
+  abridged-convert convert abridged Web --entry "abridged/Series/[Creator] Show"
+  abridged-convert convert abridged Web --entry "abridged/Songs/[~] AMVs/[Creator] Song.mkv\""""
+
+DEPLOY_EXAMPLES = """\
+  # Preview a deploy, then run it
+  abridged-convert deploy abridged bitpile:Abridged --dry-run
+  abridged-convert deploy abridged bitpile:Abridged
+
+  # Interrupted? Run the same command again to resume.
+
+  # Deploy only one category or entry
+  abridged-convert deploy abridged bitpile:Abridged --category Shots
+  abridged-convert deploy abridged bitpile:Abridged --entry "abridged/Shots/[Creator] Shot\""""
+
+REBUILD_EXAMPLES = """\
+  # Recovery only: Web/ has videos but .abridged-video-metadata.json is gone
+  abridged-convert rebuild-metadata abridged Web
+  abridged-convert rebuild-metadata abridged Web --upload bitpile:Abridged"""
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=CLI_DESCRIPTION)
-    parser.add_argument(
-        "input_dir",
-        type=Path,
-        nargs="?",
-        help="Input directory containing Series/Shots/Shorts/Songs, or a single category directory.",
-    )
-    parser.add_argument(
-        "output_dir",
-        type=Path,
-        nargs="?",
-        help="Output root directory, typically named Web.",
-    )
-    parser.add_argument(
-        "--repo-root",
-        dest="legacy_input_dir",
-        type=Path,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--output-root",
-        dest="legacy_output_dir",
-        type=Path,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
+def _epilog(*example_blocks: str) -> str:
+    return "examples:\n" + "\n\n".join(example_blocks) + "\n\n" + PATH_RULES
+
+
+def category_arg(value: str) -> str:
+    # Canonicalise case first so argparse's `choices` check accepts "series" and lists the valid names on a typo.
+    return {category.lower(): category for category in CATEGORY_ORDER}.get(value.lower(), value)
+
+
+def _add_scope_args(sub: argparse.ArgumentParser) -> None:
+    scope = sub.add_mutually_exclusive_group()
+    scope.add_argument(
         "--category",
         dest="categories",
         action="append",
-        help="Limit conversion to a category. Repeat the flag to include multiple categories.",
+        type=category_arg,
+        choices=CATEGORY_ORDER,
+        metavar="{" + ",".join(CATEGORY_ORDER) + "}",
+        help="Only process this category (case-insensitive, repeatable).",
     )
-    parser.add_argument(
-        "--ffmpeg",
-        default=shutil.which("ffmpeg") or "ffmpeg",
-        help="Path to the ffmpeg executable used for video conversion and cover sidecar generation.",
+    scope.add_argument(
+        "--entry",
+        dest="entries",
+        action="append",
+        type=Path,
+        metavar="PATH",
+        help="Only process this entry: ARCHIVE/<Category>/<entry> or ARCHIVE/Songs/[~] AMVs/<file> (repeatable).",
     )
-    parser.add_argument(
-        "--ffprobe",
-        default=shutil.which("ffprobe") or "ffprobe",
-        help="Path to the ffprobe executable used to inspect streams and metadata before conversion.",
+
+
+def _add_tool_args(sub: argparse.ArgumentParser, *, rclone: bool) -> None:
+    group = sub.add_argument_group("advanced")
+    group.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg", metavar="PATH", help="ffmpeg executable.")
+    group.add_argument("--ffprobe", default=shutil.which("ffprobe") or "ffprobe", metavar="PATH", help="ffprobe executable.")
+    if rclone:
+        group.add_argument("--rclone", default=shutil.which("rclone") or "rclone", metavar="PATH", help="rclone executable.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    formatter = argparse.RawDescriptionHelpFormatter
+    parser = ColorArgumentParser(
+        prog=PROG,
+        description="Convert the abridged archive into web outputs and deploy them to an rclone remote.",
+        epilog=_epilog(CONVERT_EXAMPLES, DEPLOY_EXAMPLES, REBUILD_EXAMPLES),
+        formatter_class=formatter,
     )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace existing output files instead of skipping them.",
+    commands = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND")
+    commands.required = True
+
+    convert = commands.add_parser(
+        "convert",
+        help="Convert ARCHIVE into OUTPUT locally.",
+        description="Convert ARCHIVE into OUTPUT locally and write OUTPUT/.abridged-video-metadata.json.",
+        epilog=_epilog(CONVERT_EXAMPLES),
+        formatter_class=formatter,
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Discover and report planned work without writing output files.",
+    convert.add_argument("archive", type=Path, metavar="ARCHIVE", help="Archive root containing Series/ Shots/ Shorts/ Songs/.")
+    convert.add_argument("output", type=Path, metavar="OUTPUT", help="Web root to write into, e.g. Web.")
+    convert.add_argument("--dry-run", action="store_true", help="Show what would be converted without writing anything.")
+    convert.add_argument("--overwrite", action="store_true", help="Re-convert outputs that already exist.")
+    _add_scope_args(convert)
+    _add_tool_args(convert, rclone=False)
+
+    deploy = commands.add_parser(
+        "deploy",
+        help="Convert what changed and upload it to REMOTE.",
+        description=(
+            "Convert new or changed entries and upload them to REMOTE.\n"
+            "The remote .abridged-video-metadata.json decides what is already deployed.\n"
+            "Converted files are staged in a temp dir and removed after a successful upload.\n"
+            "If a run is interrupted, run the same command again to resume (until a reboot\n"
+            "clears the temp dir, then it starts again). While a run is unfinished,\n"
+            f"ARCHIVE/{DEPLOY_POINTER_FILENAME} records where its temp dir is."
+        ),
+        epilog=_epilog(DEPLOY_EXAMPLES),
+        formatter_class=formatter,
     )
-    parser.add_argument(
-        "--deploy",
-        metavar="REMOTE",
-        help="Upload converted outputs to an rclone remote and clean local staging after success.",
+    deploy.add_argument("archive", type=Path, metavar="ARCHIVE", help="Archive root containing Series/ Shots/ Shorts/ Songs/.")
+    deploy.add_argument("remote", metavar="REMOTE", help="rclone remote for the catalog folder, e.g. bitpile:Abridged.")
+    deploy.add_argument("--dry-run", action="store_true", help="Plan uploads and deletes without changing the remote or the archive.")
+    deploy.add_argument("--overwrite", action="store_true", help="Re-convert and re-upload even unchanged entries.")
+    _add_scope_args(deploy)
+    _add_tool_args(deploy, rclone=True)
+
+    rebuild = commands.add_parser(
+        "rebuild-metadata",
+        help="Recovery: rebuild the metadata file from existing outputs.",
+        description=(
+            "Recovery only. Use when OUTPUT already holds converted videos and covers but\n"
+            ".abridged-video-metadata.json is missing. Nothing is re-encoded.\n"
+            "With --upload, also uploads the outputs and the rebuilt metadata to REMOTE."
+        ),
+        epilog=_epilog(REBUILD_EXAMPLES),
+        formatter_class=formatter,
     )
-    parser.add_argument(
-        "--rclone",
-        default=shutil.which("rclone") or "rclone",
-        help="Path to the rclone executable used by --deploy.",
-    )
-    parser.add_argument(
-        "--deploy-dry-run",
-        action="store_true",
-        help="Plan deploy uploads and deletes without mutating the remote or writing converted outputs.",
-    )
-    parser.add_argument(
-        "--keep-staging",
-        action="store_true",
-        help="Keep deploy staging files after a successful upload.",
-    )
-    parser.add_argument(
-        "--bootstrap-deploy",
-        action="store_true",
-        help="Generate deploy metadata/state from existing output files instead of converting.",
-    )
+    rebuild.add_argument("archive", type=Path, metavar="ARCHIVE", help="Archive root containing Series/ Shots/ Shorts/ Songs/.")
+    rebuild.add_argument("output", type=Path, metavar="OUTPUT", help="Web root that holds the existing outputs.")
+    rebuild.add_argument("--upload", dest="remote", metavar="REMOTE", help="Also upload to this rclone remote.")
+    rebuild.add_argument("--dry-run", action="store_true", help="Report what would be written or uploaded.")
+    _add_tool_args(rebuild, rclone=True)
     return parser
 
 
-def parse_args(argv: Iterable[str]) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+@dataclass(frozen=True)
+class RunOptions:
+    command: str
+    archive: Path
+    output: Path | None  # None for deploy until main() picks the temp staging dir
+    remote: str | None
+    dry_run: bool
+    overwrite: bool
+    categories: tuple[str, ...]  # as given; empty means every category
+    entries: tuple[Path, ...]
+    ffmpeg: str
+    ffprobe: str
+    rclone: str
+
+
+def parse_args(argv: Iterable[str]) -> RunOptions:
     parser = build_parser()
-    return parser, parser.parse_args(list(argv))
+    argv = list(argv)
+    if not argv:
+        parser.print_help(sys.stderr)
+        raise SystemExit(2)
+    args = parser.parse_args(argv)
+    return RunOptions(
+        command=args.command,
+        archive=args.archive.resolve(),
+        output=args.output.resolve() if args.command != "deploy" else None,
+        remote=args.remote if args.command != "convert" else None,
+        dry_run=args.dry_run,
+        overwrite=getattr(args, "overwrite", False),
+        categories=tuple(dict.fromkeys(getattr(args, "categories", None) or ())),
+        entries=tuple(path.resolve() for path in getattr(args, "entries", None) or ()),
+        ffmpeg=args.ffmpeg,
+        ffprobe=args.ffprobe,
+        rclone=getattr(args, "rclone", "rclone"),
+    )
 
 
-def resolve_cli_dirs(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[Path, Path]:
-    input_dir = args.input_dir or args.legacy_input_dir
-    output_dir = args.output_dir or args.legacy_output_dir
-    if input_dir is None:
-        parser.error("the following arguments are required: input_dir, output_dir")
-    if output_dir is None:
-        if args.legacy_input_dir is None:
-            parser.error("the following arguments are required: input_dir, output_dir")
-        output_dir = input_dir / "Web"
-    return input_dir.resolve(), output_dir.resolve()
+def _category_name(path: Path) -> str | None:
+    return {category.lower(): category for category in CATEGORY_ORDER}.get(path.name.lower())
 
 
-def source_signature_root_for_input(input_dir: Path, category_roots: dict[str, Path]) -> Path:
-    resolved_input = input_dir.resolve()
-    if any(category_root.resolve() == resolved_input for category_root in category_roots.values()):
-        return resolved_input.parent
-    return resolved_input
+def _display(path: Path) -> str:
+    try:
+        text = path.relative_to(Path.cwd()).as_posix() or "."
+    except ValueError:
+        text = path.as_posix()
+    return f'"{text}"' if " " in text else text
+
+
+def suggested_command(options: RunOptions, archive: Path, output: Path | None, *, narrow_to: str | None) -> str:
+    parts = [PROG, options.command, _display(archive)]
+    if output is not None:
+        parts.append(_display(output))
+    if options.command == "deploy":
+        parts.append(str(options.remote))
+    elif options.remote is not None:
+        parts.extend(["--upload", str(options.remote)])
+    for flag, enabled in (("--dry-run", options.dry_run), ("--overwrite", options.overwrite)):
+        if enabled:
+            parts.append(flag)
+    for category in options.categories:
+        parts.extend(["--category", category])
+    for entry in options.entries:
+        parts.extend(["--entry", _display(entry)])
+    if narrow_to and options.command != "rebuild-metadata" and not options.categories and not options.entries:
+        parts.extend(["--category", narrow_to])
+    return " ".join(parts)
+
+
+def validate_cli_paths(options: RunOptions) -> None:
+    """Reject category-level paths with a corrected command; never reinterpret them."""
+    archive_category = _category_name(options.archive)
+    output_category = _category_name(options.output) if options.output is not None else None
+    if archive_category or output_category:
+        archive = options.archive.parent if archive_category else options.archive
+        output = options.output.parent if output_category and options.output is not None else options.output
+        narrowed = archive_category or output_category
+        what = "ARCHIVE must be the archive root" if archive_category else "OUTPUT must be the web root"
+        try_command = suggested_command(options, archive, output, narrow_to=narrowed)
+        raise ConversionError(f"{what}, not the {narrowed} category folder.\n  Try: {try_command}")
+    if not any((options.archive / category).is_dir() for category in CATEGORY_ORDER):
+        expected = ", ".join(f"{category}/" for category in CATEGORY_ORDER)
+        raise ConversionError(f"ARCHIVE must be the archive root containing {expected}: {options.archive}")
+
+
+ENTRY_SHAPES = "ARCHIVE/<Category>/<entry> (a folder) or ARCHIVE/Songs/[~] AMVs/<file>"
+
+
+def entry_matches(job: Job, entry: Path) -> bool:
+    if entry.is_dir():
+        return job.entry_dir.resolve() == entry
+    return job.source_video.resolve() == entry and entry.parent.name == AMV_DIR_NAME
+
+
+def select_entries(jobs: list[Job], archive: Path, entries: tuple[Path, ...]) -> list[Job]:
+    for entry in entries:
+        try:
+            relative = entry.relative_to(archive).as_posix()
+        except ValueError:
+            raise ConversionError(f"--entry must be inside ARCHIVE ({archive}): {entry}\n  expected {ENTRY_SHAPES}") from None
+        if not entry.exists():
+            raise ConversionError(f"--entry does not exist: {entry}")
+        if not any(entry_matches(job, entry) for job in jobs):
+            raise ConversionError(f"--entry is not a convertible entry: {relative}\n  expected {ENTRY_SHAPES}")
+    return [job for job in jobs if any(entry_matches(job, entry) for entry in entries)]
+
+
+def run_scope(output_dir: Path, jobs: list[Job], categories: list[str], entries: tuple[Path, ...]) -> tuple[str, ...]:
+    if not entries:
+        return tuple(categories)
+    return tuple(dict.fromkeys(relative_output_key(output_dir, job.output_file.parent) for job in jobs))
 
 
 def print_metadata_status(
@@ -201,69 +357,155 @@ def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: object
     plans.append(next_plan)
 
 
+def discover_selected_jobs(options: RunOptions) -> tuple[list[Job], list[ConversionResult], list[str]]:
+    if options.entries:
+        requested = entry_categories(options.archive, options.entries) or CATEGORY_ORDER
+    else:
+        requested = options.categories or CATEGORY_ORDER
+    _, categories, _ = resolve_input_roots(options.archive, normalize_categories(requested))
+    jobs, failures = discover_jobs(options.archive, categories, options.output)
+    if options.entries:
+        jobs = select_entries(jobs, options.archive, options.entries)
+        selected_dirs = {job.entry_dir.resolve() for job in jobs}
+        failures = [result for result in failures if result.entry_dir.resolve() in selected_dirs or result.entry_dir.resolve() in options.entries]
+    return jobs, failures, list(categories)
+
+
+def entry_categories(archive: Path, entries: tuple[Path, ...]) -> tuple[str, ...]:
+    categories: list[str] = []
+    for entry in entries:
+        try:
+            head = entry.relative_to(archive).parts[0]
+        except (ValueError, IndexError):
+            continue
+        category = _category_name(Path(head))
+        if category is not None and category not in categories:
+            categories.append(category)
+    return tuple(categories)
+
+
+def run_rebuild_metadata(options: RunOptions, log) -> int:
+    jobs, discovery_failures, categories = discover_selected_jobs(options)
+    if discovery_failures:
+        messages = "; ".join(result.message for result in discovery_failures)
+        raise ConversionError(f"cannot rebuild metadata with discovery failures: {messages}")
+    summary = bootstrap_deploy_from_existing_outputs(
+        rclone_bin=options.rclone,
+        remote_root=options.remote,
+        input_root=options.archive,
+        staging_root=options.output,
+        jobs=jobs,
+        prune_scope=categories,
+        ffprobe_bin=options.ffprobe,
+        ffmpeg_bin=options.ffmpeg,
+        dry_run=options.dry_run,
+        keep_staging=True,  # in recovery OUTPUT is the only copy of the converted files
+        log=log,
+    )
+    print(
+        "Rebuild: "
+        f"items={summary.changed} "
+        f"uploaded={summary.uploaded} "
+        f"deleted={summary.deleted} "
+        f"metadata={summary.metadata_path}",
+        file=sys.stdout,
+    )
+    return 0
+
+
+def new_staging_dir() -> Path:
+    return Path(tempfile.mkdtemp(prefix=STAGING_PREFIX))
+
+
+def read_deploy_pointer(archive: Path) -> dict[str, str] | None:
+    try:
+        pointer = json.loads((archive / DEPLOY_POINTER_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pointer, dict) or not all(isinstance(pointer.get(key), str) for key in ("remote", "staging")):
+        return None
+    return pointer
+
+
+def _is_our_staging(path: Path) -> bool:
+    # A pointer is a plain file anyone can edit, so only ever reuse or delete dirs this tool created.
+    return path.name.startswith(STAGING_PREFIX) and path.is_dir()
+
+
+def clear_deploy_pointer(archive: Path) -> None:
+    (archive / DEPLOY_POINTER_FILENAME).unlink(missing_ok=True)
+
+
+def choose_staging(options: RunOptions, stack: ExitStack, log) -> tuple[Path, bool]:
+    """Pick the deploy staging dir: resume an unfinished run's temp dir, or start a fresh one.
+
+    Returns the dir and whether this call created it.
+    """
+    pointer = read_deploy_pointer(options.archive)
+    if pointer is not None:
+        previous = Path(pointer["staging"])
+        if pointer["remote"] == options.remote and _is_our_staging(previous):
+            return previous, False
+        if pointer["remote"] != options.remote:
+            log(f"unfinished deploy to {pointer['remote']} is discarded; starting again")
+            if not options.dry_run and _is_our_staging(previous):
+                shutil.rmtree(previous)
+        else:
+            log("previous run's staging is gone; starting again")
+    if options.dry_run:
+        return Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=STAGING_PREFIX))), False
+    staging = new_staging_dir()
+    pointer_path = options.archive / DEPLOY_POINTER_FILENAME
+    pointer_path.write_text(json.dumps({"remote": options.remote, "staging": str(staging)}, indent=2) + "\n", encoding="utf-8")
+    return staging, True
+
+
 def main(argv: Iterable[str] | None = None) -> int:
-    parser, args = parse_args(sys.argv[1:] if argv is None else argv)
-    input_dir, output_dir = resolve_cli_dirs(parser, args)
+    options = parse_args(sys.argv[1:] if argv is None else argv)
+    with ExitStack() as stack:
+        return _run(options, stack)
+
+
+def _run(options: RunOptions, stack: ExitStack) -> int:
     ui: TerminalUI | None = None
     deploy_context = None
-    operation_dry_run = args.dry_run or args.deploy_dry_run
+    fresh_staging = False
+    interrupted_message = "Interrupted. Run the same command again to resume." if options.command == "deploy" else "Interrupted."
 
     def early_log(message: str) -> None:
         print(f"Deploy: {message}", file=sys.stdout, flush=True)
 
     try:
-        validate_tools(args.ffmpeg, args.ffprobe)
-        requested_categories = normalize_categories(args.categories or CATEGORY_ORDER)
-        category_roots, categories, _ = resolve_input_roots(input_dir, requested_categories)
-        source_signature_root = source_signature_root_for_input(input_dir, category_roots)
-        jobs, discovery_failures = discover_jobs(input_dir, categories, output_dir)
+        validate_cli_paths(options)
+        validate_tools(options.ffmpeg, options.ffprobe)
+        if options.command == "rebuild-metadata":
+            return run_rebuild_metadata(options, early_log)
+        if options.command == "deploy":
+            validate_remote_root(str(options.remote))
+            staging, fresh_staging = choose_staging(options, stack, early_log)
+            options = replace(options, output=staging)
+        input_dir, output_dir = options.archive, options.output
+        jobs, discovery_failures, categories = discover_selected_jobs(options)
+        scope = run_scope(output_dir, jobs, categories, options.entries)
         encoding_by_job: dict[tuple[str, str], VideoEncodingConfig] = {}
-        if not args.bootstrap_deploy and not args.deploy:
+        if options.command == "convert":
             planned_jobs = []
             for job in jobs:
-                output_suffix, encoding = resolve_video_handling_plan(args.ffprobe, args.ffmpeg, job.source_video)
+                output_suffix, encoding = resolve_video_handling_plan(options.ffprobe, options.ffmpeg, job.source_video)
                 planned_job = replace(job, output_file=job.output_file.with_suffix(output_suffix))
                 planned_jobs.append(planned_job)
                 encoding_by_job[(str(planned_job.source_video), str(planned_job.output_file))] = encoding
             jobs = planned_jobs
-        if args.bootstrap_deploy:
-            if discovery_failures:
-                messages = "; ".join(result.message for result in discovery_failures)
-                raise ConversionError(f"cannot bootstrap deploy metadata with discovery failures: {messages}")
-            bootstrap_summary = bootstrap_deploy_from_existing_outputs(
-                rclone_bin=args.rclone,
-                remote_root=args.deploy,
-                input_root=input_dir,
-                source_signature_root=source_signature_root,
-                staging_root=output_dir,
-                jobs=jobs,
-                prune_categories=categories,
-                ffprobe_bin=args.ffprobe,
-                ffmpeg_bin=args.ffmpeg,
-                dry_run=operation_dry_run,
-                keep_staging=args.keep_staging,
-                log=early_log,
-            )
-            print(
-                "Bootstrap: "
-                f"items={bootstrap_summary.changed} "
-                f"uploaded={bootstrap_summary.uploaded} "
-                f"deleted={bootstrap_summary.deleted} "
-                f"metadata={bootstrap_summary.metadata_path}",
-                file=sys.stdout,
-            )
-            return 0
-        if args.deploy:
+        if options.command == "deploy":
             deploy_context = prepare_deploy_context(
-                rclone_bin=args.rclone,
-                remote_root=args.deploy,
+                rclone_bin=options.rclone,
+                remote_root=options.remote,
                 input_root=input_dir,
-                source_signature_root=source_signature_root,
                 staging_root=output_dir,
                 jobs=jobs,
-                prune_categories=categories,
-                force=args.overwrite,
-                dry_run=operation_dry_run,
+                prune_scope=scope,
+                force=options.overwrite,
+                dry_run=options.dry_run,
                 log=early_log,
             )
             jobs = [plan.job for plan in deploy_context.plans]
@@ -273,7 +515,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             encoding=None,
             jobs=jobs,
             discovery_failures=discovery_failures,
-            persist_final_report=operation_dry_run,
+            persist_final_report=options.dry_run,
             stream=sys.stdout,
         )
         ui.start()
@@ -283,17 +525,25 @@ def main(argv: Iterable[str] | None = None) -> int:
             ui.set_phase("Idle", "No convertible entries found")
             ui.set_final_summary(converted=0, skipped=0, failed=len(discovery_failures))
             ui.finish(1)
+            if deploy_context is not None and not options.dry_run and not deploy_context.resumed:
+                # Nothing was planned or uploaded, so leave no staging or pointer behind.
+                clean_staging(output_dir, input_root=input_dir)
+                clear_deploy_pointer(input_dir)
             print("No convertible entries found.", file=sys.stderr)
             return 1
     except ConversionError as exc:
         if ui is not None:
             ui.close()
+        if fresh_staging and deploy_context is None:
+            # Failed before anything was staged (e.g. remote unreachable): there is nothing to resume.
+            clean_staging(options.output, input_root=options.archive)
+            clear_deploy_pointer(options.archive)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         if ui is not None:
             ui.close()
-        print("Interrupted.", file=sys.stderr)
+        print(interrupted_message, file=sys.stderr)
         return 130
 
     try:
@@ -340,12 +590,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                 skipped += 1
                 continue
 
-            if deploy_context is not None and operation_dry_run:
+            if deploy_context is not None and options.dry_run:
                 if deploy_plan is not None and deploy_plan.needs_conversion:
                     deploy_plan = finalize_deploy_plan_for_conversion(
                         deploy_plan,
-                        args.ffprobe,
-                        args.ffmpeg,
+                        options.ffprobe,
+                        options.ffmpeg,
                         deploy_context.staging_root,
                         encoding_by_job,
                     )
@@ -373,11 +623,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
                 try:
                     subtitle_keys = backfill_subtitles(
-                        args.rclone,
+                        options.rclone,
                         deploy_context,
                         deploy_plan,
-                        ffmpeg_bin=args.ffmpeg,
-                        ffprobe_bin=args.ffprobe,
+                        ffmpeg_bin=options.ffmpeg,
+                        ffprobe_bin=options.ffprobe,
                         log=early_log if not ui.enabled else None,
                     )
                 except ConversionError as exc:
@@ -414,8 +664,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             if deploy_context is not None and deploy_plan is not None and deploy_plan.needs_conversion:
                 deploy_plan = finalize_deploy_plan_for_conversion(
                     deploy_plan,
-                    args.ffprobe,
-                    args.ffmpeg,
+                    options.ffprobe,
+                    options.ffmpeg,
                     deploy_context.staging_root,
                     encoding_by_job,
                 )
@@ -424,11 +674,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             ui.mark_running(display_job)
             result = convert_job(
                 work_job,
-                ffmpeg_bin=args.ffmpeg,
-                ffprobe_bin=args.ffprobe,
+                ffmpeg_bin=options.ffmpeg,
+                ffprobe_bin=options.ffprobe,
                 encoding=encoding_by_job[(str(work_job.source_video), str(work_job.output_file))],
-                overwrite=args.overwrite or deploy_context is not None,
-                dry_run=args.dry_run,
+                overwrite=options.overwrite or deploy_context is not None,
+                dry_run=options.dry_run,
             )
             ui.mark_result(display_job, result)
             ui.print_result_line(result)
@@ -441,17 +691,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                         record_pending_deploy_item(
                             deploy_context,
                             deploy_plan,
-                            ffprobe_bin=args.ffprobe,
+                            ffprobe_bin=options.ffprobe,
                             subtitles=result.subtitles,
                         )
                         metadata_discovered += 1
                         metadata_output_path = deploy_context.metadata_path
                         metadata_probed += 1
                         successful_deploy_outputs.add(deploy_plan.output_key)
-                if deploy_context is None and not args.dry_run:
+                if deploy_context is None and not options.dry_run:
                     output_key = cache_key_for_path(output_dir, result.output_file)
                     deploy_item = {
-                        "source": source_signature(source_signature_root, job.source_video),
+                        "source": source_signature(input_dir, job.source_video),
                         "outputPath": output_key,
                         "coverPath": cache_key_for_path(output_dir, cover_output_path_for_job(job)),
                     }
@@ -460,7 +710,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     update_summary = update_metadata_cache_item_with_tracking(
                         output_dir,
                         result.output_file,
-                        ffprobe_bin=args.ffprobe,
+                        ffprobe_bin=options.ffprobe,
                         deploy_item=deploy_item,
                     )
                     metadata_discovered += 1
@@ -484,27 +734,29 @@ def main(argv: Iterable[str] | None = None) -> int:
         if deploy_context is not None and not failures:
             ui.set_phase("Deploy", "Uploading staged files")
             deploy_summary = finalize_deploy(
-                rclone_bin=args.rclone,
+                rclone_bin=options.rclone,
                 context=deploy_context,
-                ffprobe_bin=args.ffprobe,
+                ffprobe_bin=options.ffprobe,
                 successful_output_keys=successful_deploy_outputs,
-                dry_run=operation_dry_run,
-                keep_staging=args.keep_staging,
+                dry_run=options.dry_run,
+                keep_staging=False,
                 input_root=input_dir,
                 log=deploy_log,
             )
-        elif deploy_context is None and not args.dry_run and output_dir.is_dir() and not failures:
+            if not options.dry_run:
+                clear_deploy_pointer(input_dir)
+        elif deploy_context is None and not options.dry_run and output_dir.is_dir() and not failures:
             prune_summary = prune_unexpected_metadata_cache_items(
                 output_dir,
                 expected_metadata_keys,
-                categories=categories,
+                scope=scope,
                 delete_files=True,
             )
             metadata_pruned = prune_summary.pruned
             metadata_pruned_keys = prune_summary.pruned_keys
             metadata_output_path = metadata_output_path or prune_summary.output_path
-        elif deploy_context is None and not args.dry_run and output_dir.is_dir():
-            prune_summary = prune_missing_metadata_cache_items(output_dir, categories=categories)
+        elif deploy_context is None and not options.dry_run and output_dir.is_dir():
+            prune_summary = prune_missing_metadata_cache_items(output_dir, scope=scope)
             metadata_pruned = prune_summary.pruned
             metadata_pruned_keys = prune_summary.pruned_keys
             metadata_output_path = metadata_output_path or prune_summary.output_path
@@ -527,13 +779,13 @@ def main(argv: Iterable[str] | None = None) -> int:
                 failures=failures,
             )
         if deploy_summary is not None:
-            print_deploy_summary(deploy_summary, remote=args.deploy)
+            print_deploy_summary(deploy_summary, remote=options.remote)
         return 1 if failures else 0
     except ConversionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        print(interrupted_message, file=sys.stderr)
         return 130
     finally:
         if ui is not None:

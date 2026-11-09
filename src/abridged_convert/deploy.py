@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
-from abridged_convert.common import normalize_categories, path_is_in_categories, source_signature
+from abridged_convert.common import normalize_scope, path_in_scope, source_signature
 from abridged_convert.constants import CATEGORY_ORDER
 from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles, is_subtitle_sidecar_name
 from abridged_convert.metadata import (
@@ -53,7 +53,7 @@ class DeployContext:
     metadata_path: Path
     metadata_items: dict[str, dict[str, Any]]
     plans: list[DeployJobPlan]
-    prune_categories: tuple[str, ...]
+    prune_scope: tuple[str, ...]
     deploy_run_signature: str
     resumed: bool
     dangling_paths: tuple[str, ...] = ()
@@ -78,7 +78,7 @@ def bootstrap_deploy_from_existing_outputs(
     source_signature_root: Path | None = None,
     staging_root: Path,
     jobs: list[Job],
-    prune_categories: Iterable[str],
+    prune_scope: Iterable[str],
     ffprobe_bin: str,
     ffmpeg_bin: str = "ffmpeg",
     dry_run: bool,
@@ -136,7 +136,7 @@ def bootstrap_deploy_from_existing_outputs(
         if plan.output_key in metadata_items:
             uploaded_paths.extend(subtitle_keys(metadata_items[plan.output_key]))
 
-    prune_scope = normalize_categories(prune_categories)
+    prune_scope = normalize_scope(prune_scope)
     expected_files = expected_remote_files(plans) | set(uploaded_paths)
     remote_files: set[str] = set()
     safe_remote_root = None
@@ -223,7 +223,7 @@ def prepare_deploy_context(
     source_signature_root: Path | None = None,
     staging_root: Path,
     jobs: list[Job],
-    prune_categories: Iterable[str],
+    prune_scope: Iterable[str],
     force: bool,
     dry_run: bool = False,
     log: DeployLogger | None = None,
@@ -285,7 +285,7 @@ def prepare_deploy_context(
         metadata_items,
         jobs=jobs,
         source_signature_root=source_signature_root or input_root,
-        prune_categories=normalize_categories(prune_categories),
+        prune_scope=normalize_scope(prune_scope),
     )
     plans = build_deploy_plans(
         source_signature_root=source_signature_root or input_root,
@@ -304,7 +304,7 @@ def prepare_deploy_context(
         metadata_path=metadata_path,
         metadata_items=metadata_items,
         plans=plans,
-        prune_categories=normalize_categories(prune_categories),
+        prune_scope=normalize_scope(prune_scope),
         deploy_run_signature=deploy_run_signature,
         resumed=resumed,
         dangling_paths=dangling_paths,
@@ -425,16 +425,16 @@ def dangling_paths_from_metadata(
     *,
     jobs: list[Job],
     source_signature_root: Path,
-    prune_categories: Iterable[str],
+    prune_scope: Iterable[str],
 ) -> tuple[str, ...]:
     local_sources = {
         (signature["path"], signature["size"])
         for signature in (source_signature(source_signature_root, job.source_video) for job in jobs)
     }
-    selected_categories = normalize_categories(prune_categories)
+    selected_scope = normalize_scope(prune_scope)
     dangling: set[str] = set()
     for key, item in metadata_items.items():
-        if not path_is_in_categories(key, selected_categories):
+        if not path_in_scope(key, selected_scope):
             continue
         source = item.get("source")
         if not isinstance(source, dict):
@@ -465,7 +465,7 @@ def finalize_deploy(
     next_metadata_items: dict[str, dict[str, Any]] = {
         key: item
         for key, item in context.metadata_items.items()
-        if not path_is_in_categories(key, context.prune_categories)
+        if not path_in_scope(key, context.prune_scope)
     }
     uploaded_paths: list[str] = []
 
@@ -485,6 +485,14 @@ def finalize_deploy(
             upload_paths.append(METADATA_CACHE_FILENAME)
         planned_paths = {relpath for plan in context.plans for relpath in (plan.output_key, plan.cover_key)}
         dry_run_deletes = [relpath for relpath in context.dangling_paths if relpath not in planned_paths]
+        orphans = find_orphaned_remote_files(
+            rclone_bin,
+            context,
+            expected=referenced_remote_paths(context.metadata_items) | planned_paths | set(dry_run_deletes),
+            protect_changed_sidecars=True,
+            log=log,
+        )
+        dry_run_deletes.extend(orphans)
         log_dry_run_remote_actions(log, uploads=upload_paths, deletes=dry_run_deletes)
         return DeploySummary(
             uploaded=len(upload_paths),
@@ -567,6 +575,9 @@ def finalize_deploy(
     # A replaced source at the same path leaves its old entry dangling, but the new entry reuses the same
     # output/cover/subtitle paths, which were just uploaded and must survive the cleanup.
     dangling = [relpath for relpath in context.dangling_paths if relpath not in expected_after]
+    # Files the catalog no longer references, e.g. left by a run that died between the catalog upload and the deletes.
+    orphans = find_orphaned_remote_files(rclone_bin, context, expected=expected_after | set(dangling), log=log)
+    dangling.extend(orphans)
     delete_remote_files(rclone_bin, context.remote_root, dangling, kept_files=expected_after, log=log)
     # Stale subtitle sidecars sit beside a still-deployed video, so their directories are never removed.
     stale = sorted(set(context.stale_paths) - expected_after - set(dangling))
@@ -587,6 +598,58 @@ def finalize_deploy(
         changed=sum(1 for plan in context.plans if plan.changed),
         metadata_path=context.metadata_path,
     )
+
+
+ORPHAN_SWEEP_LIMIT = 10
+
+
+def find_orphaned_remote_files(
+    rclone_bin: str,
+    context: DeployContext,
+    *,
+    expected: set[str],
+    protect_changed_sidecars: bool = False,
+    log: DeployLogger | None = None,
+) -> list[str]:
+    """Remote files inside the run's scope that nothing in the catalog references.
+
+    A dry run doesn't know the subtitle names of entries it has yet to convert, so it passes
+    ``protect_changed_sidecars`` to keep anything sharing a changed output's stem off the list.
+    """
+    emit(log, f"listing remote files to find orphans: {context.remote_root}")
+    remote_files = list_remote_files(rclone_bin, context.remote_root)
+    in_scope = {
+        relpath
+        for relpath in remote_files
+        if relpath != METADATA_CACHE_FILENAME and path_in_scope(relpath, context.prune_scope)
+    }
+    orphans = sorted(
+        relpath
+        for relpath in in_scope - expected
+        if not (protect_changed_sidecars and belongs_to_planned_output(relpath, context.plans))
+    )
+    if len(orphans) > ORPHAN_SWEEP_LIMIT and len(orphans) * 2 > len(in_scope):
+        # Normally only a handful of strays; most of the remote looking orphaned means the catalog is off.
+        emit(
+            log,
+            f"WARNING: {len(orphans)} of {len(in_scope)} remote file(s) look orphaned; not deleting them. "
+            "Check the remote catalog, or run rebuild-metadata.",
+        )
+        return []
+    emit(log, f"found {len(orphans)} orphaned remote file(s)")
+    return orphans
+
+
+def belongs_to_planned_output(relpath: str, plans: list[DeployJobPlan]) -> bool:
+    # Sidecars (cover, subtitles) of an output this run uploads share its directory and stem.
+    path = PurePosixPath(relpath)
+    for plan in plans:
+        if not plan.changed:
+            continue
+        output = PurePosixPath(plan.output_key)
+        if path.parent == output.parent and (path.stem == output.stem or path.name.startswith(f"{output.stem}.")):
+            return True
+    return False
 
 
 def referenced_remote_paths(items: dict[str, dict[str, Any]]) -> set[str]:
@@ -732,14 +795,14 @@ def pending_output_files_ready(job: Job, item: dict[str, Any] | None = None) -> 
 def dangling_remote_files(
     remote_files: set[str],
     expected_files: set[str],
-    prune_categories: tuple[str, ...],
+    prune_scope: tuple[str, ...],
 ) -> set[str]:
-    if set(prune_categories) == set(CATEGORY_ORDER):
+    if set(prune_scope) == set(CATEGORY_ORDER):
         return remote_files - expected_files
     return {
         relpath
         for relpath in remote_files - expected_files
-        if path_is_in_categories(relpath, prune_categories)
+        if path_in_scope(relpath, prune_scope)
     }
 
 

@@ -56,7 +56,7 @@ class AbridgedConvertTests:
         (series_entry / 'covers').mkdir(parents=True)
         self._make_cover_image(series_entry / 'covers' / '1.png', 'green')
         self._make_source_video(series_entry / 'Episode 1 - Pilot.mkv', title='Episode 1 - Pilot', description='Series Description', comment='Series Comment')
-        exit_code = main(['--repo-root', str(self.repo_root)])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web')])
         assert exit_code == 0
         assert (self.repo_root / 'Web' / 'Shots' / '[Creator] Shot Entry' / '1.mp4').exists()
         assert (self.repo_root / 'Web' / 'Shots' / '[Creator] Shot Entry' / '1.webp').exists()
@@ -83,7 +83,7 @@ class AbridgedConvertTests:
         self._make_cover_image(external_cover, 'red')
         self._make_cover_image(embedded_cover, 'blue')
         self._make_source_video(entry / '1.mkv', title='Embedded Cover', description='desc', comment='comment', add_cover_stream=embedded_cover)
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Shots' / '[Creator] Embedded First' / '1.mp4'
         cover_output = self.repo_root / 'Web' / 'Shots' / '[Creator] Embedded First' / '1.webp'
@@ -106,7 +106,7 @@ class AbridgedConvertTests:
         entry = self.repo_root / 'Shots' / '[MyToasterIsMoist] Interspecies Reviewers Abridged'
         entry.mkdir()
         self._make_source_video(entry / '1.mkv', title='Wrong Source Title', artist='Wrong Source Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Shots' / '[MyToasterIsMoist] Interspecies Reviewers Abridged' / '1.mp4'
         tags = normalize_probe_tags(ffprobe_json(output))
@@ -119,7 +119,7 @@ class AbridgedConvertTests:
         external_cover = entry / 'cover.png'
         self._make_cover_image(external_cover, 'red')
         self._make_source_video(entry / '1.mkv', title='Wrong Song Title', artist='Wrong Song Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Songs'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Songs'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Songs' / "[Nantoka Narusou] Gendo's Paradise" / '1.mp4'
         cover_output = self.repo_root / 'Web' / 'Songs' / "[Nantoka Narusou] Gendo's Paradise" / '1.webp'
@@ -137,7 +137,7 @@ class AbridgedConvertTests:
         self._make_cover_image(matched_cover, 'green')
         self._make_cover_image(covers_dir / 'Burn The House Down [ AMV - Mix ] Anime Mix [94hviaWK8UE].png', 'red')
         self._make_source_video(amv_root / '[monomogu] Uptown Funk.mkv', title='Wrong AMV Title', artist='Wrong AMV Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Songs'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Songs'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Songs' / 'AMV' / '[monomogu] Uptown Funk' / '1.mp4'
         cover_output = self.repo_root / 'Web' / 'Songs' / 'AMV' / '[monomogu] Uptown Funk' / '1.webp'
@@ -154,7 +154,7 @@ class AbridgedConvertTests:
         matched_cover = covers_dir / 'Gintama AMV - ＤＲＯＰＰＥＤ [JiSIVsKy-N8].png'
         self._make_cover_image(matched_cover, 'blue')
         self._make_source_video(amv_root / '[YushiieChii] D R O P P E D.mkv', title='Wrong AMV Title', artist='Wrong AMV Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Songs'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Songs'])
         assert exit_code == 0
         cover_output = self.repo_root / 'Web' / 'Songs' / 'AMV' / '[YushiieChii] D R O P P E D' / '1.webp'
         assert cover_output.exists()
@@ -164,7 +164,7 @@ class AbridgedConvertTests:
         entry = self.repo_root / 'Series' / '[2GS BootLegged] Fire Hoez'
         entry.mkdir()
         self._make_source_video(entry / 'Episode 1 - something.mkv', title='Wrong Episode Title', artist='Wrong Source Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Series'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Series'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Series' / '[2GS BootLegged] Fire Hoez' / 'Episode 1 - something.mp4'
         tags = normalize_probe_tags(ffprobe_json(output))
@@ -177,7 +177,7 @@ class AbridgedConvertTests:
         self._make_cover_image(entry / 'covers' / '1.png', 'green')
         self._make_cover_image(entry / 'covers' / '2.png', 'red')
         self._make_source_video(entry / 'Episode 1 - Pilot.mkv', title='Episode 1 - Pilot', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Series'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Series'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Series' / '[Creator] Matching Covers' / 'Episode 1 - Pilot.mp4'
         cover_output = self.repo_root / 'Web' / 'Series' / '[Creator] Matching Covers' / 'Episode 1 - Pilot.webp'
@@ -194,7 +194,7 @@ class AbridgedConvertTests:
         self._make_source_video(entry / 'Episode 1 - Pilot.mkv', title='Pilot', description='desc', comment='comment', duration=21)
         stdout = io.StringIO()
         with redirect_stdout(stdout):
-            exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Series'])
+            exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Series'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Series' / '[Creator] No Matching Covers' / 'Episode 1 - Pilot.mp4'
         cover_output = self.repo_root / 'Web' / 'Series' / '[Creator] No Matching Covers' / 'Episode 1 - Pilot.webp'
@@ -213,7 +213,7 @@ class AbridgedConvertTests:
         self._make_cover_image(titled_cover, 'green')
         self._make_cover_image(numeric_cover, 'red')
         self._make_source_video(entry / 'Episode 0.5 - This is a College Class on Rap.mkv', title='Episode 0.5 - This is a College Class on Rap', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Series'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Series'])
         assert exit_code == 0
         cover_output = self.repo_root / 'Web' / 'Series' / '[Creator] Mixed Cover Signals' / 'Episode 0.5 - This is a College Class on Rap.webp'
         assert cover_output.exists()
@@ -228,7 +228,7 @@ class AbridgedConvertTests:
         embedded_cover = self.repo_root / 'embedded-series-cover.png'
         self._make_cover_image(embedded_cover, 'blue')
         self._make_source_video(entry / 'Episode 14 - Kurosai Cinematic Universe.mkv', title='Episode 14 - Kurosai Cinematic Universe', description='desc', comment='comment', add_cover_stream=embedded_cover)
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Series'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Series'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Series' / '[Creator] Embedded Series Cover' / 'Episode 14 - Kurosai Cinematic Universe.mp4'
         cover_output = self.repo_root / 'Web' / 'Series' / '[Creator] Embedded Series Cover' / 'Episode 14 - Kurosai Cinematic Universe.webp'
@@ -264,7 +264,7 @@ class AbridgedConvertTests:
         external_cover = entry / 'cover.png'
         self._make_cover_image(external_cover, 'red')
         self._make_source_video(entry / '1.webm', title='Wrong Source Title', artist='Wrong Source Artist', description='desc', comment='comment')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shorts'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shorts'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Shorts' / '[Creator] Webm Source' / '1.webm'
         cover_output = self.repo_root / 'Web' / 'Shorts' / '[Creator] Webm Source' / '1.webp'
@@ -278,7 +278,7 @@ class AbridgedConvertTests:
         entry = self.repo_root / 'Shorts' / '[Creator] Webm Compatible MKV'
         entry.mkdir()
         self._make_source_video(entry / '1.mkv', title='Wrong Source Title', artist='Wrong Source Artist', description='desc', comment='comment', audio_codec='libopus')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shorts'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shorts'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Shorts' / '[Creator] Webm Compatible MKV' / '1.webm'
         assert output.exists()
@@ -296,7 +296,7 @@ class AbridgedConvertTests:
         entry.mkdir()
         self._make_source_video(entry / '1.mkv', title='Wrong Source Title', artist='Wrong Source Artist', description='desc', comment='comment', video_codec='ffv1', audio_codec='flac')
         assert resolve_remux_output_suffix(FFPROBE, entry / '1.mkv') is None
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shorts'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shorts'])
         assert exit_code == 0
         output = self.repo_root / 'Web' / 'Shorts' / '[Creator] Needs Encoding' / '1.mp4'
         assert output.exists()
@@ -393,7 +393,7 @@ class AbridgedConvertTests:
         assert tracking_file.parent == job.output_file.parent
         assert tracking_file.parent != job.entry_dir
         tracking_file.write_text(f'{job.output_file}\n', encoding='utf-8')
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert exit_code == 0
         assert not tracking_file.exists()
         probe = ffprobe_json(job.output_file)
@@ -418,7 +418,7 @@ class AbridgedConvertTests:
         interrupted_stderr = io.StringIO()
         with mock.patch('abridged_convert.conversion.run_command', side_effect=interrupting_run_command):
             with redirect_stdout(interrupted_stdout), redirect_stderr(interrupted_stderr):
-                exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+                exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert exit_code == 130
         assert 'Interrupted.' in interrupted_stderr.getvalue()
         assert 'Traceback' not in interrupted_stderr.getvalue()
@@ -427,7 +427,7 @@ class AbridgedConvertTests:
         resumed_stdout = io.StringIO()
         resumed_stderr = io.StringIO()
         with redirect_stdout(resumed_stdout), redirect_stderr(resumed_stderr):
-            resumed_exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+            resumed_exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert resumed_exit_code == 0
         assert not tracking_file.exists()
         probe = ffprobe_json(job.output_file)
@@ -447,7 +447,7 @@ class AbridgedConvertTests:
         stdout = io.StringIO()
         original_set_final_summary = TerminalUI.set_final_summary
         with redirect_stdout(stdout), mock.patch.object(TerminalUI, 'set_final_summary', autospec=True, side_effect=original_set_final_summary) as set_final_summary:
-            exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+            exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         output = stdout.getvalue()
         assert exit_code == 0
         assert 'Summary: converted=1 skipped=0 failed=0 pruned=1' in output
@@ -481,7 +481,7 @@ class AbridgedConvertTests:
         source = entry / '1.mkv'
         self._make_source_video(source, title='Subbed', description='desc', comment='comment')
         self._add_subtitle_streams(source, [('WEBVTT\n\n00:00.000 --> 00:00.900 align:start position:0%\nhello<00:00:00.400><c> there</c>\n', '.vtt', 'en', None, True), ('1\n00:00:00,000 --> 00:00:00,900\nHola\n', '.srt', 'es', 'Spanish (manual)', False)])
-        exit_code = main(['--repo-root', str(self.repo_root), '--category', 'Shots'])
+        exit_code = main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots'])
         assert exit_code == 0
         web_entry = self.repo_root / 'Web' / 'Shots' / '[Creator] Subbed'
         english = web_entry / '1.0.en.vtt'
@@ -496,7 +496,7 @@ class AbridgedConvertTests:
         item = metadata_cache['items']['Shots/[Creator] Subbed/1.mp4']
         assert item['subtitles'] == [{'path': 'Shots/[Creator] Subbed/1.0.en.vtt', 'language': 'en', 'label': 'en', 'default': True, 'forced': False}, {'path': 'Shots/[Creator] Subbed/1.1.es.vtt', 'language': 'es', 'label': 'Spanish (manual)', 'default': False, 'forced': False}]
         spanish.unlink()
-        assert main(['--repo-root', str(self.repo_root), '--category', 'Shots']) == 0
+        assert main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots']) == 0
         assert spanish.is_file()
 
     def test_source_without_subtitles_records_empty_list(self) -> None:
@@ -504,7 +504,7 @@ class AbridgedConvertTests:
         entry.mkdir()
         self._make_cover_image(entry / 'cover.png', 'red')
         self._make_source_video(entry / '1.mkv', title='Unsubbed', description='desc', comment='comment')
-        assert main(['--repo-root', str(self.repo_root), '--category', 'Shots']) == 0
+        assert main(['convert', str(self.repo_root), str(self.repo_root / 'Web'), '--category', 'Shots']) == 0
         metadata_cache = json.loads((self.repo_root / 'Web' / '.abridged-video-metadata.json').read_text(encoding='utf-8'))
         assert metadata_cache['items']['Shots/[Creator] Unsubbed/1.mp4']['subtitles'] == []
 

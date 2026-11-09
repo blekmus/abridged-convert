@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from abridged_convert.common import normalize_categories, path_is_in_categories
+from abridged_convert.common import normalize_scope, path_in_scope, scope_categories
 from abridged_convert.constants import CATEGORY_ORDER, VIDEO_EXTENSIONS
 from abridged_convert.models import ConversionError
 
@@ -83,7 +83,7 @@ def update_metadata_cache_item_with_tracking(
 def prune_missing_metadata_cache_items(
     archive_root: Path,
     *,
-    categories: Iterable[str] | None = None,
+    scope: Iterable[str] | None = None,
 ) -> MetadataPruneSummary:
     resolved_archive_root = archive_root.resolve()
     if not resolved_archive_root.is_dir():
@@ -95,19 +95,15 @@ def prune_missing_metadata_cache_items(
         return MetadataPruneSummary(pruned=0, output_path=cache_path, written=False)
 
     existing_deploy_items = load_cache_deploy_items(cache_path)
-    selected_categories = normalize_categories(categories, allow_none=True, error_label="metadata category")
+    selected_scope = normalize_scope(scope)
     discovered_keys = {
         cache_key_for_path(resolved_archive_root, video_path)
-        for video_path in discover_archive_videos(resolved_archive_root, categories=selected_categories)
+        for video_path in discover_archive_videos(resolved_archive_root, categories=scope_categories(selected_scope))
     }
     next_items = {
         key: value
         for key, value in existing_items.items()
-        if (
-            selected_categories is not None
-            and not path_is_in_categories(key, selected_categories)
-        )
-        or key in discovered_keys
+        if not path_in_scope(key, selected_scope) or key in discovered_keys
     }
     pruned_keys = tuple(sorted(set(existing_items) - set(next_items)))
     if not pruned_keys:
@@ -121,7 +117,7 @@ def prune_unexpected_metadata_cache_items(
     archive_root: Path,
     expected_cache_keys: set[str],
     *,
-    categories: Iterable[str] | None = None,
+    scope: Iterable[str] | None = None,
     delete_files: bool = False,
 ) -> MetadataPruneSummary:
     resolved_archive_root = archive_root.resolve()
@@ -134,12 +130,11 @@ def prune_unexpected_metadata_cache_items(
         return MetadataPruneSummary(pruned=0, output_path=cache_path, written=False)
 
     existing_deploy_items = load_cache_deploy_items(cache_path)
-    selected_categories = normalize_categories(categories, allow_none=True, error_label="metadata category")
+    selected_scope = normalize_scope(scope)
     next_items: dict[str, dict[str, Any]] = {}
     pruned_items: list[tuple[str, dict[str, Any]]] = []
     for key, item in existing_items.items():
-        scoped = selected_categories is None or path_is_in_categories(key, selected_categories)
-        if scoped and key not in expected_cache_keys:
+        if path_in_scope(key, selected_scope) and key not in expected_cache_keys:
             pruned_items.append((key, item))
             continue
         next_items[key] = item

@@ -46,7 +46,7 @@ class MetadataCacheTests:
         cache_path = self.archive_root / METADATA_CACHE_FILENAME
         cache_path.write_text(json.dumps({'version': 2, 'items': {'Shots/[Creator] Existing/1.mp4': {'size': existing_video.stat().st_size, 'modTimeUnixNano': existing_video.stat().st_mtime_ns, 'durationSeconds': 9}, 'Shots/[Creator] Missing/1.mp4': {'size': 1, 'modTimeUnixNano': 2, 'durationSeconds': 3}}}), encoding='utf-8')
         with mock.patch('abridged_convert.metadata.probe_video_metadata') as probe:
-            summary = prune_missing_metadata_cache_items(self.archive_root, categories=['Shots'])
+            summary = prune_missing_metadata_cache_items(self.archive_root, scope=['Shots'])
         cache = json.loads(cache_path.read_text(encoding='utf-8'))
         assert summary.pruned == 1
         assert summary.pruned_keys == ('Shots/[Creator] Missing/1.mp4',)
@@ -60,7 +60,7 @@ class MetadataCacheTests:
         new_video = self._write_video('Songs/AMV/[Fain] More oooooooooooof/1.mp4')
         cache_path = self.archive_root / METADATA_CACHE_FILENAME
         cache_path.write_text(json.dumps({'version': 2, 'items': {'Songs/AMV/[Fain] More/1.mp4': {'size': old_video.stat().st_size, 'modTimeUnixNano': old_video.stat().st_mtime_ns, 'durationSeconds': 225, 'source': {'path': '[~] AMVs/[Fain] More.mkv', 'size': 100, 'modTimeUnixNano': 200}, 'outputPath': 'Songs/AMV/[Fain] More/1.mp4', 'coverPath': 'Songs/AMV/[Fain] More/1.webp'}, 'Songs/AMV/[Fain] More oooooooooooof/1.mp4': {'size': new_video.stat().st_size, 'modTimeUnixNano': new_video.stat().st_mtime_ns, 'durationSeconds': 225}}}), encoding='utf-8')
-        summary = prune_unexpected_metadata_cache_items(self.archive_root, {'Songs/AMV/[Fain] More oooooooooooof/1.mp4'}, categories=['Songs'], delete_files=True)
+        summary = prune_unexpected_metadata_cache_items(self.archive_root, {'Songs/AMV/[Fain] More oooooooooooof/1.mp4'}, scope=['Songs'], delete_files=True)
         cache = json.loads(cache_path.read_text(encoding='utf-8'))
         assert summary.pruned == 1
         assert summary.pruned_keys == ('Songs/AMV/[Fain] More/1.mp4',)
@@ -86,7 +86,7 @@ class MetadataCacheTests:
             'Shots/[Creator] Shot/1.mp4': item('Shots/[Creator] Shot/1.mp4', ['Shots/[Creator] Shot/1.0.en.vtt', 'Shots/[Creator] Shot/1.1.es.vtt']),
             'Shots/[Creator] Shot/1.webm': item('Shots/[Creator] Shot/1.webm', ['Shots/[Creator] Shot/1.0.en.vtt']),
         }}), encoding='utf-8')
-        summary = prune_unexpected_metadata_cache_items(self.archive_root, {'Shots/[Creator] Shot/1.webm'}, categories=['Shots'], delete_files=True)
+        summary = prune_unexpected_metadata_cache_items(self.archive_root, {'Shots/[Creator] Shot/1.webm'}, scope=['Shots'], delete_files=True)
         assert summary.pruned_keys == ('Shots/[Creator] Shot/1.mp4',)
         assert not old_video.exists()
         assert not dropped_subtitle.exists()

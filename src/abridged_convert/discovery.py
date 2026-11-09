@@ -60,20 +60,8 @@ def resolve_input_roots(
             resolved_input / "Web",
         )
 
-    valid_categories = {category.lower(): category for category in CATEGORY_ORDER}
-    direct_category = valid_categories.get(resolved_input.name.lower())
-    if direct_category is not None:
-        if direct_category not in requested_categories:
-            requested = ", ".join(requested_categories)
-            raise ConversionError(
-                f"input directory is {direct_category}, which does not match the requested categories: {requested}"
-            )
-        return ({direct_category: resolved_input}, [direct_category], resolved_input.parent / "Web")
-
-    expected = ", ".join(CATEGORY_ORDER)
-    raise ConversionError(
-        f"input directory must either contain {expected} folders or point to one of those category folders directly"
-    )
+    expected = ", ".join(f"{category}/" for category in CATEGORY_ORDER)
+    raise ConversionError(f"ARCHIVE must be the archive root containing {expected}: {resolved_input}")
 
 
 def discovery_failure(
