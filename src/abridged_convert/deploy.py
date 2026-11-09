@@ -3,13 +3,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
-from abridged_convert.common import normalize_scope, path_in_scope, source_signature
+from abridged_convert.common import normalize_scope, path_in_scope, source_signatures
 from abridged_convert.constants import CATEGORY_ORDER
 from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles, is_subtitle_sidecar_name
 from abridged_convert.metadata import (
@@ -92,17 +93,19 @@ def bootstrap_deploy_from_existing_outputs(
     emit(log, f"bootstrap using existing outputs in {resolved_staging}")
 
     metadata_path = resolved_staging / METADATA_CACHE_FILENAME
+    bootstrap_jobs = [job_with_existing_output(job) for job in jobs]
+    signatures = source_signatures(resolved_source_signature_root, [job.source_video for job in bootstrap_jobs])
     plans = [
         DeployJobPlan(
             job=job,
             output_key=relative_output_key(resolved_staging, job.output_file),
             cover_key=relative_output_key(resolved_staging, cover_output_path_for_job(job)),
-            source_signature=source_signature(resolved_source_signature_root, job.source_video),
+            source_signature=signature,
             changed=True,
             needs_conversion=False,
             reason="bootstrap",
         )
-        for job in (job_with_existing_output(job) for job in jobs)
+        for job, signature in zip(bootstrap_jobs, signatures, strict=True)
     ]
     uploaded_paths: list[str] = []
     metadata_items: dict[str, dict[str, Any]] = {}
@@ -281,22 +284,25 @@ def prepare_deploy_context(
         if not downloaded:
             emit(log, f"initializing missing {METADATA_CACHE_FILENAME}")
 
+    emit(log, f"remote catalog has {len(metadata_items)} item(s); comparing {len(jobs)} local source(s)")
+    compare_started = time.monotonic()
+    # One stat pass over the archive; both the prune check and the plans need every source's signature.
+    signatures = source_signatures(source_signature_root or input_root, [job.source_video for job in jobs])
     dangling_paths = dangling_paths_from_metadata(
         metadata_items,
-        jobs=jobs,
-        source_signature_root=source_signature_root or input_root,
+        signatures=signatures,
         prune_scope=normalize_scope(prune_scope),
     )
     plans = build_deploy_plans(
-        source_signature_root=source_signature_root or input_root,
         staging_root=resolved_staging,
         jobs=jobs,
+        signatures=signatures,
         metadata_items=metadata_items,
         force=force,
     )
     changed = sum(1 for plan in plans if plan.changed)
     skipped = len(plans) - changed
-    emit(log, f"planned {changed} changed item(s), {skipped} unchanged item(s)")
+    emit(log, f"planned {changed} changed item(s), {skipped} unchanged item(s) ({time.monotonic() - compare_started:.1f}s)")
 
     return DeployContext(
         remote_root=safe_remote_root,
@@ -321,16 +327,15 @@ def journal_stale_paths(journal: dict[str, Any]) -> list[str]:
 
 def build_deploy_plans(
     *,
-    source_signature_root: Path,
     staging_root: Path,
     jobs: list[Job],
+    signatures: list[dict[str, Any]],
     metadata_items: dict[str, dict[str, Any]],
     force: bool,
 ) -> list[DeployJobPlan]:
     plans: list[DeployJobPlan] = []
     metadata_by_source = metadata_items_by_source(metadata_items)
-    for job in jobs:
-        signature = source_signature(source_signature_root, job.source_video)
+    for job, signature in zip(jobs, signatures, strict=True):
         matched_key, matched_item = matching_metadata_item(metadata_by_source, signature)
         if matched_item is not None:
             output_key = metadata_output_key(matched_key, matched_item)
@@ -423,14 +428,10 @@ def metadata_cover_key(output_key: str, item: dict[str, Any]) -> str:
 def dangling_paths_from_metadata(
     metadata_items: dict[str, dict[str, Any]],
     *,
-    jobs: list[Job],
-    source_signature_root: Path,
+    signatures: Iterable[dict[str, Any]],
     prune_scope: Iterable[str],
 ) -> tuple[str, ...]:
-    local_sources = {
-        (signature["path"], signature["size"])
-        for signature in (source_signature(source_signature_root, job.source_video) for job in jobs)
-    }
+    local_sources = {(signature["path"], signature["size"]) for signature in signatures}
     selected_scope = normalize_scope(prune_scope)
     dangling: set[str] = set()
     for key, item in metadata_items.items():

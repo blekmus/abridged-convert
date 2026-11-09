@@ -5,6 +5,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -357,17 +358,24 @@ def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: object
     plans.append(next_plan)
 
 
-def discover_selected_jobs(options: RunOptions) -> tuple[list[Job], list[ConversionResult], list[str]]:
+def discover_selected_jobs(options: RunOptions, log=None) -> tuple[list[Job], list[ConversionResult], list[str]]:
     if options.entries:
         requested = entry_categories(options.archive, options.entries) or CATEGORY_ORDER
     else:
         requested = options.categories or CATEGORY_ORDER
     _, categories, _ = resolve_input_roots(options.archive, normalize_categories(requested))
+    started = time.monotonic()
+    if log is not None:
+        log(f"scanning archive {options.archive}: {', '.join(categories)}")
     jobs, failures = discover_jobs(options.archive, categories, options.output)
     if options.entries:
         jobs = select_entries(jobs, options.archive, options.entries)
         selected_dirs = {job.entry_dir.resolve() for job in jobs}
         failures = [result for result in failures if result.entry_dir.resolve() in selected_dirs or result.entry_dir.resolve() in options.entries]
+    if log is not None:
+        entries = len({job.entry_dir for job in jobs})
+        problems = f", {len(failures)} entr(ies) with problems" if failures else ""
+        log(f"found {len(jobs)} video(s) in {entries} entr(ies){problems} ({time.monotonic() - started:.1f}s)")
     return jobs, failures, list(categories)
 
 
@@ -385,7 +393,7 @@ def entry_categories(archive: Path, entries: tuple[Path, ...]) -> tuple[str, ...
 
 
 def run_rebuild_metadata(options: RunOptions, log) -> int:
-    jobs, discovery_failures, categories = discover_selected_jobs(options)
+    jobs, discovery_failures, categories = discover_selected_jobs(options, log)
     if discovery_failures:
         messages = "; ".join(result.message for result in discovery_failures)
         raise ConversionError(f"cannot rebuild metadata with discovery failures: {messages}")
@@ -477,6 +485,9 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
 
     try:
         validate_cli_paths(options)
+        status_log = early_log if options.command != "convert" else None
+        if status_log is not None:
+            status_log("checking ffmpeg and ffprobe")
         validate_tools(options.ffmpeg, options.ffprobe)
         if options.command == "rebuild-metadata":
             return run_rebuild_metadata(options, early_log)
@@ -485,7 +496,7 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
             staging, fresh_staging = choose_staging(options, stack, early_log)
             options = replace(options, output=staging)
         input_dir, output_dir = options.archive, options.output
-        jobs, discovery_failures, categories = discover_selected_jobs(options)
+        jobs, discovery_failures, categories = discover_selected_jobs(options, status_log)
         scope = run_scope(output_dir, jobs, categories, options.entries)
         encoding_by_job: dict[tuple[str, str], VideoEncodingConfig] = {}
         if options.command == "convert":

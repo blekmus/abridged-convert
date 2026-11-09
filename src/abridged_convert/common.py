@@ -73,11 +73,22 @@ def scope_categories(scope: Iterable[str]) -> tuple[str, ...]:
 
 
 def source_signature(input_root: Path, source_path: Path) -> dict[str, Any]:
+    return _signature_under(input_root.resolve(), source_path)
+
+
+def source_signatures(input_root: Path, source_paths: Iterable[Path]) -> list[dict[str, Any]]:
+    """Signatures for many sources, resolving the root once; each resolve costs a stat per path part."""
+    resolved_root = input_root.resolve()
+    return [_signature_under(resolved_root, path) for path in source_paths]
+
+
+def _signature_under(resolved_root: Path, source_path: Path) -> dict[str, Any]:
     stat = source_path.stat()
+    resolved_source = source_path.resolve()
     try:
-        relative_source_path = source_path.resolve().relative_to(input_root.resolve()).as_posix()
+        relative_source_path = resolved_source.relative_to(resolved_root).as_posix()
     except ValueError:
-        relative_source_path = source_path.resolve().as_posix()
+        relative_source_path = resolved_source.as_posix()
     return {
         "path": relative_source_path,
         "size": stat.st_size,
