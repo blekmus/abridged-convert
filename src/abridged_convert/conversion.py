@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from abridged_convert.media import (
     cpu_video_encoding_config,
     expected_subtitle_sidecars,
     extract_subtitle_sidecars,
+    process_error_message,
     remove_subtitle_sidecars,
     run_command,
     write_cover_sidecar,
@@ -23,21 +25,27 @@ from abridged_convert.models import ConversionError, ConversionResult, EntryMeta
 
 
 def tracking_file_for_job(job: Job) -> Path:
-    token = re.sub(r"[^A-Za-z0-9._-]+", "_", job.output_file.stem).strip("._") or "output"
+    token = hashlib.sha256(job.output_file.name.encode("utf-8")).hexdigest()
     return job.output_file.parent / f".abridged-convert.{token}.incomplete"
 
 
-def remove_incomplete_output(output_file: Path) -> None:
-    if output_file.exists():
-        output_file.unlink()
+def discard_partial_outputs(job: Job, cover_output_path: Path) -> None:
+    job.output_file.unlink(missing_ok=True)
+    cover_output_path.unlink(missing_ok=True)
+    remove_subtitle_sidecars(job.output_file)
 
 
 def resume_interrupted_job(job: Job, *, dry_run: bool) -> bool:
     tracking_file = tracking_file_for_job(job)
     if not tracking_file.exists():
-        return False
+        # Accept old markers only when their contents identify this exact output.
+        token = re.sub(r"[^A-Za-z0-9._-]+", "_", job.output_file.stem).strip("._") or "output"
+        legacy = job.output_file.parent / f".abridged-convert.{token}.incomplete"
+        if not legacy.is_file() or legacy.read_text(encoding="utf-8").strip() != str(job.output_file):
+            return False
+        tracking_file = legacy
     if not dry_run:
-        remove_incomplete_output(job.output_file)
+        job.output_file.unlink(missing_ok=True)
         tracking_file.unlink(missing_ok=True)
     return True
 
@@ -71,12 +79,7 @@ def convert_job(
     overwrite: bool,
     dry_run: bool,
 ) -> ConversionResult:
-    result = ConversionResult(
-        category=job.category,
-        entry_dir=job.entry_dir,
-        source_video=job.source_video,
-        output_file=job.output_file,
-    )
+    result = ConversionResult.for_job(job)
     tracking_file = tracking_file_for_job(job)
     resumed_from_incomplete = resume_interrupted_job(job, dry_run=dry_run)
 
@@ -99,7 +102,7 @@ def convert_job(
             except subprocess.CalledProcessError as exc:
                 result.success = False
                 result.skipped = False
-                result.message = exc.stderr.strip() or exc.stdout.strip() or "subtitle extraction failed"
+                result.message = process_error_message(exc, "subtitle extraction failed")
         return result
 
     with tempfile.TemporaryDirectory(prefix="abridged-convert-") as temp_dir_name:
@@ -110,7 +113,7 @@ def convert_job(
             result.message = str(exc)
             return result
         except subprocess.CalledProcessError as exc:
-            result.message = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
+            result.message = process_error_message(exc, "ffmpeg failed")
             return result
         result.cover_source = cover_source
         cover_output_path = cover_output_path_for_job(job)
@@ -122,6 +125,7 @@ def convert_job(
 
         job.output_file.parent.mkdir(parents=True, exist_ok=True)
         tracking_file.write_text(f"{job.output_file}\n", encoding="utf-8")
+        fell_back_to_cpu = False
         ffmpeg_cmd = build_ffmpeg_command(
             ffmpeg_bin,
             job.source_video,
@@ -131,60 +135,44 @@ def convert_job(
             encoding,
         )
 
-        keep_tracking_file = False
         try:
-            run_command(ffmpeg_cmd)
+            try:
+                run_command(ffmpeg_cmd)
+            except subprocess.CalledProcessError as exc:
+                stderr = process_error_message(exc, "ffmpeg failed")
+                if encoding.mode != "nvidia" or not any(marker in stderr.lower() for marker in GPU_ERROR_MARKERS):
+                    raise
+                fell_back_to_cpu = True
+                run_command(
+                    build_ffmpeg_command(
+                        ffmpeg_bin,
+                        job.source_video,
+                        job.output_file,
+                        metadata,
+                        cover_path,
+                        cpu_video_encoding_config(),
+                    )
+                )
             result.subtitles = write_sidecars(ffmpeg_bin, job, metadata, cover_path, cover_output_path)
         except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
-            if encoding.mode == "nvidia" and any(marker in stderr.lower() for marker in GPU_ERROR_MARKERS):
-                fallback_encoding = cpu_video_encoding_config()
-                ffmpeg_cmd = build_ffmpeg_command(
-                    ffmpeg_bin,
-                    job.source_video,
-                    job.output_file,
-                    metadata,
-                    cover_path,
-                    fallback_encoding,
-                )
-                try:
-                    run_command(ffmpeg_cmd)
-                    result.subtitles = write_sidecars(ffmpeg_bin, job, metadata, cover_path, cover_output_path)
-                except subprocess.CalledProcessError:
-                    remove_incomplete_output(job.output_file)
-                    cover_output_path.unlink(missing_ok=True)
-                    remove_subtitle_sidecars(job.output_file)
-                    result.message = stderr
-                    return result
-                except KeyboardInterrupt:
-                    keep_tracking_file = True
-                    remove_incomplete_output(job.output_file)
-                    cover_output_path.unlink(missing_ok=True)
-                    remove_subtitle_sidecars(job.output_file)
-                    raise
-                result.success = True
-                result.message = (
-                    "resumed after interruption; fell back to cpu after gpu failure"
-                    if resumed_from_incomplete
-                    else "converted (fell back to cpu after gpu failure)"
-                )
-                return result
-            remove_incomplete_output(job.output_file)
-            cover_output_path.unlink(missing_ok=True)
-            remove_subtitle_sidecars(job.output_file)
-            result.message = stderr
+            discard_partial_outputs(job, cover_output_path)
+            tracking_file.unlink(missing_ok=True)
+            result.message = process_error_message(exc, "ffmpeg failed")
             return result
         except KeyboardInterrupt:
-            keep_tracking_file = True
-            remove_incomplete_output(job.output_file)
-            cover_output_path.unlink(missing_ok=True)
-            remove_subtitle_sidecars(job.output_file)
+            # The tracking file stays so the next run knows this output is incomplete.
+            discard_partial_outputs(job, cover_output_path)
             raise
-        finally:
-            if not keep_tracking_file:
-                tracking_file.unlink(missing_ok=True)
+        tracking_file.unlink(missing_ok=True)
 
     result.success = True
+    if fell_back_to_cpu:
+        result.message = (
+            "resumed after interruption; fell back to cpu after gpu failure"
+            if resumed_from_incomplete
+            else "converted (fell back to cpu after gpu failure)"
+        )
+        return result
     action = "remuxed" if encoding.mode == "copy" else "converted"
     result.message = f"resumed after interruption; {action}" if resumed_from_incomplete else action
     return result

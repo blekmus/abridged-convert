@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -27,6 +28,17 @@ MP4_VIDEO_CODECS = {"av1", "h264", "hevc", "mpeg4", "vp9"}
 
 def run_command(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def process_error_message(exc: subprocess.CalledProcessError, default: str) -> str:
+    """The most useful line of output from a failed tool, or `default` when it printed nothing."""
+    return (exc.stderr or "").strip() or (exc.stdout or "").strip() or default
+
+
+def is_cover_stream(stream: dict, *, have_video: bool) -> bool:
+    """A video stream that is really cover art: flagged attached_pic, or an image codec after the main video."""
+    disposition = stream.get("disposition") or {}
+    return bool(disposition.get("attached_pic")) or (have_video and stream.get("codec_name") in IMAGE_CODECS)
 
 
 def ffprobe_json(ffprobe_bin: str, media_path: Path) -> dict:
@@ -79,9 +91,7 @@ def collect_metadata(ffprobe_bin: str, media_path: Path) -> EntryMetadata:
         tags = normalize_tags(stream.get("tags", {}))
 
         if stream_type == "video":
-            is_attached_pic = bool(disposition.get("attached_pic"))
-            looks_like_cover = stream.get("codec_name") in IMAGE_CODECS and metadata.video_index is not None
-            if is_attached_pic or looks_like_cover:
+            if is_cover_stream(stream, have_video=metadata.video_index is not None):
                 if metadata.attached_cover_index is None:
                     metadata.attached_cover_index = stream["index"]
                     metadata.attached_cover_codec = stream.get("codec_name")
@@ -127,12 +137,9 @@ def primary_av_codecs(probe: dict) -> tuple[str | None, str | None]:
     for stream in probe.get("streams", []):
         stream_type = stream.get("codec_type")
         codec_name = stream.get("codec_name")
-        disposition = stream.get("disposition") or {}
 
         if stream_type == "video":
-            is_attached_pic = bool(disposition.get("attached_pic"))
-            looks_like_cover = codec_name in IMAGE_CODECS and video_codec is not None
-            if is_attached_pic or looks_like_cover:
+            if is_cover_stream(stream, have_video=video_codec is not None):
                 continue
             if video_codec is None:
                 video_codec = codec_name
@@ -275,7 +282,9 @@ def generate_video_thumbnail(
     raise ConversionError("ffmpeg did not produce a thumbnail frame")
 
 
+@functools.cache
 def ffmpeg_supports_encoder(ffmpeg_bin: str, encoder_name: str) -> bool:
+    # Cached: the answer is fixed for the process, and asking costs an ffmpeg launch per re-encoded job.
     completed = run_command([ffmpeg_bin, "-hide_banner", "-encoders"], check=False)
     if completed.returncode != 0:
         return False
@@ -338,7 +347,7 @@ def build_ffmpeg_command(
 
     if metadata.video_language:
         cmd.extend(["-metadata:s:v:0", f"language={metadata.video_language}"])
-    if metadata.audio_language and metadata.audio_index is not None:
+    if metadata.audio_language:
         cmd.extend(["-metadata:s:a:0", f"language={metadata.audio_language}"])
 
     for key, value in metadata.tags.items():
@@ -471,7 +480,7 @@ def extract_subtitle_sidecars(
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     cmd = [ffmpeg_bin, "-y", "-v", "error", "-i", str(source_video)]
-    for stream, sidecar in zip(streams, sidecars):
+    for stream, sidecar in zip(streams, sidecars, strict=True):
         codec = "copy" if stream.codec == "webvtt" else "webvtt"
         cmd.extend(["-map", f"0:{stream.index}", "-c:s", codec, "-f", "webvtt", str(sidecar["path"])])
     try:
@@ -493,7 +502,7 @@ def extract_source_subtitles(
         metadata = collect_metadata(ffprobe_bin, source_video)
         return extract_subtitle_sidecars(ffmpeg_bin, source_video, metadata.subtitle_streams, output_file)
     except subprocess.CalledProcessError as exc:
-        message = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg failed"
+        message = process_error_message(exc, "ffmpeg failed")
         raise ConversionError(f"subtitle extraction failed for {source_video}: {message}") from exc
 
 

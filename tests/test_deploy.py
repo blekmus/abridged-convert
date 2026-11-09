@@ -46,7 +46,10 @@ class FakeRclone:
             if not destination.startswith(f'{self.remote_root}/'):
                 raise AssertionError(f'deletefile left remote root: {args}')
             relpath = destination.removeprefix(f'{self.remote_root}/')
-            self.files.pop(relpath, None)
+            if relpath not in self.files:
+                # Real rclone fails deletefile on a missing object, so callers must not re-delete.
+                raise ConversionError(f'object not found: {relpath}')
+            del self.files[relpath]
             return subprocess.CompletedProcess([rclone_bin, *args], 0, stdout='', stderr='')
         if args[0] == 'rmdir':
             destination = args[1]
@@ -352,6 +355,89 @@ class DeployTests:
         assert 'Shots/[Removed] Shot' in rclone.removed_dirs()
         assert {'Shots/[Creator] Shot/1.mp4', 'Shots/[Creator] Shot/1.webp', METADATA_CACHE_FILENAME} <= set(rclone.files)
 
+    def test_cleanup_failure_keeps_journal_in_progress_and_resumes(self) -> None:
+        rclone = self._deployed_remote()
+        orphan = 'Shots/[Removed] Shot/1.mp4'
+        rclone.files[orphan] = b'old'
+        with self._patched_deploy(rclone):
+            with mock.patch('abridged_convert.deploy.delete_remote_file', side_effect=ConversionError('delete failed')):
+                assert main(['deploy', str(self.archive), self.remote_root]) == 2
+        journal = json.loads((self.stage / METADATA_CACHE_FILENAME).read_text(encoding='utf-8'))
+        assert journal['deployRunStatus'] == 'inProgress'
+        assert self.pointer.exists()
+        exit_code, output, convert_job = self._run_deploy(rclone)
+        assert exit_code == 0
+        assert 'resuming deploy run' in output
+        convert_job.assert_not_called()
+        assert orphan not in rclone.files
+        assert not self.pointer.exists()
+
+    def test_resume_after_partial_delete_skips_already_deleted_files(self) -> None:
+        rclone = self._deployed_remote()
+        catalog = json.loads(rclone.files[METADATA_CACHE_FILENAME])
+        removed = {'path': 'Shots/[Removed] Shot/1.mkv', 'size': 3, 'modTimeUnixNano': 1}
+        catalog['items']['Shots/[Removed] Shot/1.mp4'] = {'source': removed, 'outputPath': 'Shots/[Removed] Shot/1.mp4', 'coverPath': 'Shots/[Removed] Shot/1.webp', 'subtitles': []}
+        rclone.files[METADATA_CACHE_FILENAME] = json.dumps(catalog).encode('utf-8')
+        rclone.files['Shots/[Removed] Shot/1.mp4'] = b'old'
+        rclone.files['Shots/[Removed] Shot/1.webp'] = b'old'
+        from abridged_convert import deploy
+        real_delete = deploy.delete_remote_file
+        calls = []
+
+        def delete_then_fail(*args):
+            calls.append(args)
+            if len(calls) > 1:
+                raise ConversionError('network down')
+            real_delete(*args)
+        with self._patched_deploy(rclone):
+            with mock.patch('abridged_convert.deploy.delete_remote_file', side_effect=delete_then_fail):
+                assert main(['deploy', str(self.archive), self.remote_root]) == 2
+        assert len([path for path in rclone.files if path.startswith('Shots/[Removed] Shot/')]) == 1
+        exit_code, output, _ = self._run_deploy(rclone)
+        assert exit_code == 0, output
+        assert not any(path.startswith('Shots/[Removed] Shot/') for path in rclone.files)
+        assert not self.pointer.exists()
+
+    def test_rebuild_metadata_upload_never_deletes_remote_root_files(self) -> None:
+        self._write_existing_outputs()
+        for category in ('Series', 'Shorts', 'Songs'):
+            (self.archive / category).mkdir()
+        rclone = FakeRclone(self.remote_root, {'index.html': b'site', 'Shots/[Creator] Old Shot/1.mp4': b'old'})
+        assert self._run_rebuild_metadata(rclone) == 0
+        assert 'index.html' in rclone.files
+        assert rclone.deleted_paths() == ['Shots/[Creator] Old Shot/1.mp4']
+
+    def _remote_with_removed_entry_and_orphan(self) -> FakeRclone:
+        rclone = self._deployed_remote()
+        catalog = json.loads(rclone.files[METADATA_CACHE_FILENAME])
+        removed = {'path': 'Shots/[Removed] Shot/1.mkv', 'size': 3, 'modTimeUnixNano': 1}
+        catalog['items']['Shots/[Removed] Shot/1.mp4'] = {'source': removed, 'outputPath': 'Shots/[Removed] Shot/1.mp4', 'coverPath': 'Shots/[Removed] Shot/1.webp', 'subtitles': []}
+        rclone.files[METADATA_CACHE_FILENAME] = json.dumps(catalog).encode('utf-8')
+        rclone.files['Shots/[Removed] Shot/1.mp4'] = b'old'
+        rclone.files['Shots/[Removed] Shot/1.webp'] = b'old'
+        rclone.files['Shots/[Stray] Shot/1.mp4'] = b'stray'
+        return rclone
+
+    @pytest.mark.parametrize('dry_run', [False, True])
+    def test_summary_lists_each_deleted_file_with_its_reason(self, dry_run: bool, monkeypatch) -> None:
+        monkeypatch.setenv('NO_COLOR', '1')
+        rclone = self._remote_with_removed_entry_and_orphan()
+        exit_code, output, _ = self._run_deploy(rclone, *(['--dry-run'] if dry_run else []))
+        assert exit_code == 0
+        assert 'deleted=3' in output
+        verb, note = ('removing', 'deploy dry run') if dry_run else ('removed', 'deleted')
+        assert f'✓ {verb} Shots/[Removed] Shot/1.mp4 {note} (removed entry)' in output
+        assert f'✓ {verb} Shots/[Removed] Shot/1.webp {note} (removed entry)' in output
+        assert f'✓ {verb} Shots/[Stray] Shot/1.mp4 {note} (orphan)' in output
+
+    def test_deleted_file_list_matches_done_row_colours(self, monkeypatch) -> None:
+        monkeypatch.delenv('NO_COLOR', raising=False)
+        monkeypatch.setenv('FORCE_COLOR', '1')
+        rclone = self._remote_with_removed_entry_and_orphan()
+        _, output, _ = self._run_deploy(rclone)
+        assert '\x1b[31m✓ removed\x1b[0m \x1b[37mShots/[Removed] Shot/1.mp4\x1b[0m \x1b[2mdeleted (removed entry)\x1b[0m' in output
+        assert '\x1b[31m✓ removed\x1b[0m \x1b[37mShots/[Stray] Shot/1.mp4\x1b[0m \x1b[2mdeleted (orphan)\x1b[0m' in output
+
     def test_orphan_sweep_stays_inside_scope(self) -> None:
         rclone = self._deployed_remote()
         rclone.files['Shots/[Stray] Shot/1.mp4'] = b'stray'
@@ -539,10 +625,13 @@ class DeployTests:
         with self._patched_deploy(rclone):
             assert main(['deploy', str(self.archive), self.remote_root]) == 0
         self.fake_subtitle_languages = ['en']
-        with self._patched_deploy(rclone):
-            assert main(['deploy', str(self.archive), self.remote_root, '--overwrite']) == 0
+        exit_code, output, _ = self._run_deploy(rclone, '--overwrite')
+        assert exit_code == 0
         assert 'Shots/[Creator] Shot/1.0.en.vtt' in rclone.files
         assert 'Shots/[Creator] Shot/1.1.es.vtt' not in rclone.files
+        # Stale sidecar deletes count towards the summary and are listed with their reason.
+        assert 'deleted=1' in output
+        assert '✓ removed Shots/[Creator] Shot/1.1.es.vtt deleted (stale subtitle)' in output
 
     def test_interrupted_redeploy_still_deletes_stale_remote_sidecar_on_resume(self) -> None:
         self.fake_subtitle_languages = ['en', 'es']

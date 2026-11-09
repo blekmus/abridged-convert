@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 
 from abridged_convert.common import normalize_categories
 from abridged_convert.constants import CATEGORY_ORDER, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
@@ -165,6 +165,7 @@ def discover_jobs_for_root(category: str, input_root: Path, output_root: Path) -
                 jobs.append(discovered)
             continue
 
+        external_cover = find_external_cover(entry_dir)
         for child in sorted(entry_dir.iterdir()):
             if child.is_dir():
                 continue
@@ -176,7 +177,7 @@ def discover_jobs_for_root(category: str, input_root: Path, output_root: Path) -
                     entry_dir=entry_dir,
                     source_video=child,
                     output_file=output_root / entry_dir.name / f"{child.stem}.mp4",
-                    external_cover=find_external_cover(entry_dir),
+                    external_cover=external_cover,
                 )
             )
     return jobs, failures

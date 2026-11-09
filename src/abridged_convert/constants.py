@@ -15,6 +15,11 @@ PREFERRED_TAG_ORDER = (
     "synopsis",
 )
 CATEGORY_ORDER = ("Series", "Shots", "Shorts", "Songs")
+# Why a remote file was (or, in a dry run, would be) deleted.
+DELETE_REMOVED = "removed entry"  # its catalog entry's source is gone from the archive or was replaced
+DELETE_ORPHAN = "orphan"  # no catalog entry references it
+DELETE_STALE_SUBTITLE = "stale subtitle"  # a re-conversion produced fewer or different subtitle sidecars
+DELETE_LEGEND = "removed entry = source gone or replaced; orphan = not in the catalog; stale subtitle = replaced sidecar"
 GPU_ERROR_MARKERS = (
     "cannot load libcuda",
     "cannot init cuda",

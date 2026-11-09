@@ -8,11 +8,17 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from abridged_convert.common import normalize_scope, path_in_scope, source_signatures
-from abridged_convert.constants import CATEGORY_ORDER
-from abridged_convert.media import cover_output_path_for_job, extract_source_subtitles, is_subtitle_sidecar_name
+from abridged_convert.constants import DELETE_ORPHAN, DELETE_REMOVED, DELETE_STALE_SUBTITLE
+from abridged_convert.media import (
+    cover_output_path_for_job,
+    extract_source_subtitles,
+    is_subtitle_sidecar_name,
+    process_error_message,
+)
 from abridged_convert.metadata import (
     DEPLOY_RUN_SIGNATURE_KEY,
     DEPLOY_RUN_STATUS_IN_PROGRESS,
@@ -23,9 +29,9 @@ from abridged_convert.metadata import (
     SUBTITLES_KEY,
     build_metadata_cache_item,
     item_subtitle_paths,
-    subtitle_metadata_entries,
     load_cache_document,
     load_cache_items,
+    subtitle_metadata_entries,
     write_cache,
 )
 from abridged_convert.models import ConversionError, Job
@@ -65,10 +71,19 @@ class DeployContext:
 @dataclass(frozen=True)
 class DeploySummary:
     uploaded: int
-    deleted: int
     skipped: int
     changed: int
     metadata_path: Path
+    # (remote relative path, DELETE_* reason) for every file deleted, or that a dry run would delete.
+    deleted_files: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def deleted(self) -> int:
+        return len(self.deleted_files)
+
+
+def deletions(reason: str, relpaths: Iterable[str]) -> list[tuple[str, str]]:
+    return [(relpath, reason) for relpath in relpaths]
 
 
 def bootstrap_deploy_from_existing_outputs(
@@ -158,7 +173,7 @@ def bootstrap_deploy_from_existing_outputs(
         log_dry_run_remote_actions(log, uploads=dry_run_uploads, deletes=dangling)
         return DeploySummary(
             uploaded=len(dry_run_uploads),
-            deleted=len(dangling),
+            deleted_files=tuple(deletions(DELETE_ORPHAN, dangling)),
             skipped=0,
             changed=len(plans),
             metadata_path=metadata_path,
@@ -179,7 +194,7 @@ def bootstrap_deploy_from_existing_outputs(
 
     return DeploySummary(
         uploaded=len(uploaded_paths) if safe_remote_root is not None else 0,
-        deleted=len(dangling) if safe_remote_root is not None else 0,
+        deleted_files=tuple(deletions(DELETE_ORPHAN, dangling)) if safe_remote_root is not None else (),
         skipped=0,
         changed=len(plans),
         metadata_path=metadata_path,
@@ -235,6 +250,7 @@ def prepare_deploy_context(
     if not dry_run:
         resolved_staging.mkdir(parents=True, exist_ok=True)
     safe_remote_root = validate_remote_root(remote_root)
+    scope = normalize_scope(prune_scope)
     emit(log, f"preparing staging directory: {resolved_staging}")
     metadata_path = resolved_staging / METADATA_CACHE_FILENAME
     local_cache = load_cache_document(metadata_path)
@@ -291,7 +307,7 @@ def prepare_deploy_context(
     dangling_paths = dangling_paths_from_metadata(
         metadata_items,
         signatures=signatures,
-        prune_scope=normalize_scope(prune_scope),
+        prune_scope=scope,
     )
     plans = build_deploy_plans(
         staging_root=resolved_staging,
@@ -310,7 +326,7 @@ def prepare_deploy_context(
         metadata_path=metadata_path,
         metadata_items=metadata_items,
         plans=plans,
-        prune_scope=normalize_scope(prune_scope),
+        prune_scope=scope,
         deploy_run_signature=deploy_run_signature,
         resumed=resumed,
         dangling_paths=dangling_paths,
@@ -456,8 +472,6 @@ def finalize_deploy(
     *,
     rclone_bin: str,
     context: DeployContext,
-    ffprobe_bin: str,
-    successful_output_keys: set[str],
     dry_run: bool,
     keep_staging: bool,
     input_root: Path,
@@ -485,19 +499,24 @@ def finalize_deploy(
         if metadata_changed:
             upload_paths.append(METADATA_CACHE_FILENAME)
         planned_paths = {relpath for plan in context.plans for relpath in (plan.output_key, plan.cover_key)}
-        dry_run_deletes = [relpath for relpath in context.dangling_paths if relpath not in planned_paths]
+        remote_files = list_scope_remote_files(rclone_bin, context, log=log)
+        dry_run_deletes = [
+            relpath for relpath in context.dangling_paths if relpath not in planned_paths and relpath in remote_files
+        ]
+        referenced = referenced_remote_paths(context.metadata_items)
+        stale = sorted((set(context.stale_paths) & remote_files) - referenced - set(dry_run_deletes))
         orphans = find_orphaned_remote_files(
-            rclone_bin,
             context,
-            expected=referenced_remote_paths(context.metadata_items) | planned_paths | set(dry_run_deletes),
+            remote_files,
+            expected=referenced | planned_paths | set(dry_run_deletes) | set(stale),
             protect_changed_sidecars=True,
             log=log,
         )
-        dry_run_deletes.extend(orphans)
-        log_dry_run_remote_actions(log, uploads=upload_paths, deletes=dry_run_deletes)
+        deleted_files = deletions(DELETE_REMOVED, dry_run_deletes) + deletions(DELETE_ORPHAN, orphans) + deletions(DELETE_STALE_SUBTITLE, stale)
+        log_dry_run_remote_actions(log, uploads=upload_paths, deletes=[relpath for relpath, _ in deleted_files])
         return DeploySummary(
             uploaded=len(upload_paths),
-            deleted=len(dry_run_deletes),
+            deleted_files=tuple(deleted_files),
             skipped=sum(1 for plan in context.plans if not plan.changed),
             changed=sum(1 for plan in context.plans if plan.changed),
             metadata_path=context.metadata_path,
@@ -525,7 +544,6 @@ def finalize_deploy(
                 upload_remote_files(rclone_bin, context.remote_root, context.staging_root, item_paths, log=log)
                 uploaded_paths.extend(item_paths)
                 item.pop(ITEM_UPLOAD_PENDING_KEY, None)
-                context.metadata_items[plan.output_key] = item
                 write_deploy_journal(
                     context.metadata_path,
                     context.metadata_items,
@@ -533,19 +551,14 @@ def finalize_deploy(
                     metadata_upload_pending=True,
                     stale_paths=context.stale_paths,
                 )
-            item = dict(item)
-            item.pop(ITEM_UPLOAD_PENDING_KEY, None)
-            next_metadata_items[plan.output_key] = item
         else:
-            existing_item = context.metadata_items.get(plan.output_key)
-            if existing_item is None:
+            item = context.metadata_items.get(plan.output_key)
+            if item is None:
                 raise ConversionError(f"remote metadata is missing unchanged output: {plan.output_key}")
             emit(log, f"reusing metadata {index}/{len(context.plans)}: {plan.output_key}")
-            item = dict(existing_item)
-            item.pop(ITEM_UPLOAD_PENDING_KEY, None)
-            next_metadata_items[plan.output_key] = item
-
-        next_metadata_items[plan.output_key].update(deploy_item)
+        next_item = {key: value for key, value in item.items() if key != ITEM_UPLOAD_PENDING_KEY}
+        next_item.update(deploy_item)
+        next_metadata_items[plan.output_key] = next_item
 
     if metadata_changed:
         emit(log, f"writing {METADATA_CACHE_FILENAME}")
@@ -564,6 +577,31 @@ def finalize_deploy(
     else:
         emit(log, f"skipping {METADATA_CACHE_FILENAME}: unchanged")
 
+    expected_after = referenced_remote_paths(next_metadata_items)
+    # Deletes are driven by the journal, so a resumed run lists paths an earlier attempt already deleted;
+    # rclone fails on a missing file, so only delete what the remote still has.
+    remote_files = list_scope_remote_files(rclone_bin, context, log=log)
+    # A replaced source at the same path leaves its old entry dangling, but the new entry reuses the same
+    # output/cover/subtitle paths, which were just uploaded and must survive the cleanup.
+    dangling = [
+        relpath for relpath in context.dangling_paths if relpath not in expected_after and relpath in remote_files
+    ]
+    # Files the catalog no longer references, e.g. left by a run that died between the catalog upload and the deletes.
+    # Known stale sidecars are labelled as such, so they are kept out of the orphan sweep.
+    stale = sorted((set(context.stale_paths) & remote_files) - expected_after - set(dangling))
+    orphans = find_orphaned_remote_files(
+        context, remote_files, expected=expected_after | set(dangling) | set(stale), log=log
+    )
+    deleted_files = (
+        deletions(DELETE_REMOVED, dangling) + deletions(DELETE_ORPHAN, orphans) + deletions(DELETE_STALE_SUBTITLE, stale)
+    )
+    dangling.extend(orphans)
+    delete_remote_files(rclone_bin, context.remote_root, dangling, kept_files=expected_after, log=log)
+    # Stale subtitle sidecars sit beside a still-deployed video, so their directories are never removed.
+    for index, relpath in enumerate(stale, start=1):
+        emit(log, f"deleting stale subtitle {index}/{len(stale)}: {relpath}")
+        delete_remote_file(rclone_bin, context.remote_root, relpath)
+
     # Close the local journal (drops the in-progress marker) so a kept staging dir doesn't look interrupted.
     write_cache(
         context.metadata_path,
@@ -571,20 +609,6 @@ def finalize_deploy(
         deploy_run_signature=context.deploy_run_signature,
         include_item_upload_state=False,
     )
-
-    expected_after = referenced_remote_paths(next_metadata_items)
-    # A replaced source at the same path leaves its old entry dangling, but the new entry reuses the same
-    # output/cover/subtitle paths, which were just uploaded and must survive the cleanup.
-    dangling = [relpath for relpath in context.dangling_paths if relpath not in expected_after]
-    # Files the catalog no longer references, e.g. left by a run that died between the catalog upload and the deletes.
-    orphans = find_orphaned_remote_files(rclone_bin, context, expected=expected_after | set(dangling), log=log)
-    dangling.extend(orphans)
-    delete_remote_files(rclone_bin, context.remote_root, dangling, kept_files=expected_after, log=log)
-    # Stale subtitle sidecars sit beside a still-deployed video, so their directories are never removed.
-    stale = sorted(set(context.stale_paths) - expected_after - set(dangling))
-    for index, relpath in enumerate(stale, start=1):
-        emit(log, f"deleting stale subtitle {index}/{len(stale)}: {relpath}")
-        delete_remote_file(rclone_bin, context.remote_root, relpath)
 
     if not keep_staging:
         emit(log, f"cleaning staging directory: {context.staging_root}")
@@ -594,7 +618,7 @@ def finalize_deploy(
 
     return DeploySummary(
         uploaded=len(uploaded_paths),
-        deleted=len(dangling),
+        deleted_files=tuple(deleted_files),
         skipped=sum(1 for plan in context.plans if not plan.changed),
         changed=sum(1 for plan in context.plans if plan.changed),
         metadata_path=context.metadata_path,
@@ -604,31 +628,34 @@ def finalize_deploy(
 ORPHAN_SWEEP_LIMIT = 10
 
 
+def list_scope_remote_files(rclone_bin: str, context: DeployContext, *, log: DeployLogger | None = None) -> set[str]:
+    """Remote files inside the run's scope (category folders only, never the catalog or other root files)."""
+    emit(log, f"listing remote files: {context.remote_root}")
+    return {
+        relpath
+        for relpath in list_remote_files(rclone_bin, context.remote_root)
+        if path_in_scope(relpath, context.prune_scope)
+    }
+
+
 def find_orphaned_remote_files(
-    rclone_bin: str,
     context: DeployContext,
+    in_scope: set[str],
     *,
     expected: set[str],
     protect_changed_sidecars: bool = False,
     log: DeployLogger | None = None,
 ) -> list[str]:
-    """Remote files inside the run's scope that nothing in the catalog references.
+    """Remote files inside the run's scope (``in_scope``) that nothing in the catalog references.
 
     A dry run doesn't know the subtitle names of entries it has yet to convert, so it passes
     ``protect_changed_sidecars`` to keep anything sharing a changed output's stem off the list.
     """
-    emit(log, f"listing remote files to find orphans: {context.remote_root}")
-    remote_files = list_remote_files(rclone_bin, context.remote_root)
-    in_scope = {
-        relpath
-        for relpath in remote_files
-        if relpath != METADATA_CACHE_FILENAME and path_in_scope(relpath, context.prune_scope)
-    }
-    orphans = sorted(
-        relpath
-        for relpath in in_scope - expected
-        if not (protect_changed_sidecars and belongs_to_planned_output(relpath, context.plans))
-    )
+    candidates = in_scope - expected
+    if protect_changed_sidecars:
+        changed_stems = changed_output_stems(context.plans)
+        candidates = {relpath for relpath in candidates if not belongs_to_changed_output(relpath, changed_stems)}
+    orphans = sorted(candidates)
     if len(orphans) > ORPHAN_SWEEP_LIMIT and len(orphans) * 2 > len(in_scope):
         # Normally only a handful of strays; most of the remote looking orphaned means the catalog is off.
         emit(
@@ -641,16 +668,20 @@ def find_orphaned_remote_files(
     return orphans
 
 
-def belongs_to_planned_output(relpath: str, plans: list[DeployJobPlan]) -> bool:
+def changed_output_stems(plans: list[DeployJobPlan]) -> dict[str, set[str]]:
+    """Directory -> output stems of every output this run uploads."""
+    stems: dict[str, set[str]] = {}
+    for plan in plans:
+        if plan.changed:
+            output = PurePosixPath(plan.output_key)
+            stems.setdefault(output.parent.as_posix(), set()).add(output.stem)
+    return stems
+
+
+def belongs_to_changed_output(relpath: str, changed_stems: dict[str, set[str]]) -> bool:
     # Sidecars (cover, subtitles) of an output this run uploads share its directory and stem.
     path = PurePosixPath(relpath)
-    for plan in plans:
-        if not plan.changed:
-            continue
-        output = PurePosixPath(plan.output_key)
-        if path.parent == output.parent and (path.stem == output.stem or path.name.startswith(f"{output.stem}.")):
-            return True
-    return False
+    return any(path.name.startswith(f"{stem}.") for stem in changed_stems.get(path.parent.as_posix(), ()))
 
 
 def referenced_remote_paths(items: dict[str, dict[str, Any]]) -> set[str]:
@@ -724,6 +755,7 @@ def record_pending_deploy_item(
     )
     if item is None:
         raise ConversionError(f"failed to probe metadata for staged output: {plan.job.output_file}")
+    # The pending marker must win over anything the probe returned; it is what makes the upload resumable.
     item.update(deploy_item)
     item[SUBTITLES_KEY] = subtitle_metadata_entries(context.staging_root, subtitles or [])
     context.stale_paths.extend(set(subtitle_keys(previous_item)) - set(subtitle_keys(item)))
@@ -798,13 +830,8 @@ def dangling_remote_files(
     expected_files: set[str],
     prune_scope: tuple[str, ...],
 ) -> set[str]:
-    if set(prune_scope) == set(CATEGORY_ORDER):
-        return remote_files - expected_files
-    return {
-        relpath
-        for relpath in remote_files - expected_files
-        if path_in_scope(relpath, prune_scope)
-    }
+    # Always filter by scope, even for a full run: files at the remote root are never ours to delete.
+    return {relpath for relpath in remote_files - expected_files if path_in_scope(relpath, prune_scope)}
 
 
 def emit(log: DeployLogger | None, message: str) -> None:
@@ -864,8 +891,7 @@ def run_rclone(rclone_bin: str, args: list[str]) -> subprocess.CompletedProcess[
     except FileNotFoundError as exc:
         raise ConversionError(f"required tool not found: {rclone_bin}") from exc
     except subprocess.CalledProcessError as exc:
-        message = exc.stderr.strip() or exc.stdout.strip() or "rclone failed"
-        raise ConversionError(message) from exc
+        raise ConversionError(process_error_message(exc, "rclone failed")) from exc
 
 
 def list_remote_files(rclone_bin: str, remote_root: str) -> set[str]:
@@ -963,33 +989,20 @@ def empty_parent_dirs_for_deleted_files(
     remote_files: set[str] | None,
     kept_files: set[str] | None = None,
 ) -> list[str]:
-    candidates = {
-        PurePosixPath(relpath).parent.as_posix()
-        for relpath in relpaths
-        if PurePosixPath(relpath).parent.as_posix() != "."
-    }
-    if kept_files:
-        # Directories still holding a known deployed file are not empty; don't try to remove them.
-        candidates = {
-            dirname
-            for dirname in candidates
-            if not any(path.startswith(f"{dirname}/") for path in kept_files)
-        }
-    if remote_files is None:
-        return sorted(candidates, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
-    deleted = set(relpaths)
-    remaining = remote_files - deleted
-    empty_dirs = [
-        dirname
-        for dirname in candidates
-        if not any(path == dirname or path.startswith(f"{dirname}/") for path in remaining)
-    ]
-    return sorted(empty_dirs, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
+    candidates = {PurePosixPath(relpath).parent.as_posix() for relpath in relpaths} - {"."}
+    # Directories still holding a known deployed file (or, with a listing, any remaining file) are not empty.
+    occupied = ancestor_dirs(kept_files or ())
+    if remote_files is not None:
+        occupied |= ancestor_dirs(remote_files - set(relpaths))
+    return sorted(candidates - occupied, key=lambda dirname: (dirname.count("/"), dirname), reverse=True)
+
+
+def ancestor_dirs(relpaths: Iterable[str]) -> set[str]:
+    return {parent.as_posix() for relpath in relpaths for parent in PurePosixPath(relpath).parents} - {"."}
 
 
 def is_remote_dir_not_empty_error(exc: ConversionError) -> bool:
-    message = str(exc).lower()
-    return "not empty" in message or "directory not empty" in message
+    return "not empty" in str(exc).lower()
 
 
 def run_rclone_progress(rclone_bin: str, args: list[str]) -> None:

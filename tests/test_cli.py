@@ -310,7 +310,7 @@ class AbridgedConvertTests:
         assert compact_label(job) == 'Series  [Creator] Great Show  Episode 2 - Return'
 
     def test_tui_queue_uses_status_symbols_without_pending_rows(self) -> None:
-        ui = TerminalUI(repo_root=self.repo_root, categories=['Shots'], encoding=VideoEncodingConfig(mode='cpu', codec='libx264', extra_args=()), jobs=[], discovery_failures=[], persist_final_report=False, stream=self._fake_stream(isatty=True))
+        ui = TerminalUI(repo_root=self.repo_root, categories=['Shots'], jobs=[], discovery_failures=[], dry_run=False, stream=self._fake_stream(isatty=True))
         ui.states = [type('State', (), {'status': 'pending', 'label': 'one', 'detail': 'queued', 'message': ''})(), type('State', (), {'status': 'running', 'label': 'two', 'detail': 'working', 'message': ''})(), type('State', (), {'status': 'done', 'label': 'three', 'detail': 'done', 'message': 'embedded'})(), type('State', (), {'status': 'failed', 'label': 'four', 'detail': 'boom', 'message': ''})()]
         lines = ui._queue_lines()
         assert any(('▶ working' in line for line in lines))
@@ -319,7 +319,7 @@ class AbridgedConvertTests:
         assert not any(('pending' in line for line in lines))
 
     def test_tui_highlights_creator_brackets_in_purple(self) -> None:
-        ui = TerminalUI(repo_root=self.repo_root, categories=['Shots'], encoding=VideoEncodingConfig(mode='cpu', codec='libx264', extra_args=()), jobs=[], discovery_failures=[], persist_final_report=False, stream=self._fake_stream(isatty=True))
+        ui = TerminalUI(repo_root=self.repo_root, categories=['Shots'], jobs=[], discovery_failures=[], dry_run=False, stream=self._fake_stream(isatty=True))
         line = ui._format_state_line(type('State', (), {'status': 'done', 'label': 'Shots  [Creator] Great Show', 'detail': 'done', 'message': ''})())
         assert f'{ui.ANSI_BRIGHT_MAGENTA}[Creator]{ui.ANSI_RESET}' in line
 
@@ -339,7 +339,7 @@ class AbridgedConvertTests:
             def isatty(self) -> bool:
                 return True
         stream = Stream()
-        ui = TerminalUI(repo_root=self.repo_root, categories=['Series'], encoding=VideoEncodingConfig(mode='cpu', codec='libx264', extra_args=()), jobs=[], discovery_failures=[], persist_final_report=False, stream=stream)
+        ui = TerminalUI(repo_root=self.repo_root, categories=['Series'], jobs=[], discovery_failures=[], dry_run=False, stream=stream)
         ui.states = [type('State', (), {'status': 'done', 'label': 'Series  [Creator] Show  Episode 1', 'detail': 'done', 'message': 'embedded'})(), type('State', (), {'status': 'skipped', 'label': 'Series  [Creator] Show  Episode 2', 'detail': 'already exists', 'message': ''})(), type('State', (), {'status': 'failed', 'label': 'Series  [Creator] Show  Episode 3', 'detail': 'bad match', 'message': ''})()]
         ui.enabled = True
         ui._active = True
@@ -353,7 +353,7 @@ class AbridgedConvertTests:
         assert '↷ skipped' not in output
         assert 'Show  Episode 2' not in output
 
-    def test_tui_prints_persistent_plain_report_for_dry_run(self) -> None:
+    def test_tui_dry_run_prints_one_coloured_report_with_deleted_files(self) -> None:
 
         class Stream:
 
@@ -369,17 +369,22 @@ class AbridgedConvertTests:
             def isatty(self) -> bool:
                 return True
         stream = Stream()
-        ui = TerminalUI(repo_root=self.repo_root, categories=['Series'], encoding=VideoEncodingConfig(mode='cpu', codec='libx264', extra_args=()), jobs=[], discovery_failures=[], persist_final_report=True, stream=stream)
-        ui.states = [type('State', (), {'status': 'done', 'label': 'Series  [Creator] Show  Episode 1', 'detail': 'dry run', 'message': 'external:cover.png'})(), type('State', (), {'status': 'failed', 'label': 'Series  [Creator] Show  Episode 2', 'detail': 'bad match', 'message': ''})()]
+        ui = TerminalUI(repo_root=self.repo_root, categories=['Series'], jobs=[], discovery_failures=[], dry_run=True, stream=stream)
+        ui.states = [type('State', (), {'status': 'done', 'label': 'Series  [Creator] Show  Episode 1', 'detail': 'deploy dry run (not deployed)', 'message': 'deploy dry run (not deployed)'})()]
         ui.enabled = True
         ui._active = True
-        ui.final_message = 'converted=1 skipped=0 failed=1 pruned=0'
-        ui.finish(1)
-        output = ''.join(stream.parts)
-        assert 'Dry-run queue summary' in output
-        assert 'Summary: converted=1 skipped=0 failed=1 pruned=0' in output
-        assert '[OK] Series  [Creator] Show  Episode 1 | dry run | external:cover.png' in output
-        assert '[FAIL] Series  [Creator] Show  Episode 2 | bad match' in output
+        ui.add_deleted_items([('Series/[Gone] Show/1.mp4', 'removed entry'), ('Series/[Stray] Show/1.mp4', 'orphan'), ('Series/[Creator] Show/Episode 1.1.es.vtt', 'stale subtitle')])
+        ui.finish(0)
+        output = ''.join(stream.parts).split(ui.ANSI_EXIT_ALT_SCREEN, 1)[1]
+        # One list only: no plain duplicate of the rows, so each message appears once.
+        assert 'Dry-run queue summary' not in output
+        assert '[OK]' not in output
+        assert output.count('deploy dry run (not deployed)') == 1
+        # Styled like the done rows: red badge, white path, dim note.
+        assert f'{ui.ANSI_RED}✓ removing{ui.ANSI_RESET} {ui.ANSI_WHITE}Series/[Gone] Show/1.mp4{ui.ANSI_RESET} {ui.ANSI_DIM}deploy dry run (removed entry){ui.ANSI_RESET}' in output
+        assert f'{ui.ANSI_WHITE}Series/[Stray] Show/1.mp4{ui.ANSI_RESET} {ui.ANSI_DIM}deploy dry run (orphan){ui.ANSI_RESET}' in output
+        assert 'deploy dry run (stale subtitle)' in output
+        assert 'orphan = not in the catalog' in output
 
     def test_existing_tracking_file_deletes_partial_output_and_restarts(self) -> None:
         entry = self.repo_root / 'Shots' / '[Creator] Resume Me'
@@ -451,7 +456,7 @@ class AbridgedConvertTests:
         output = stdout.getvalue()
         assert exit_code == 0
         assert 'Summary: converted=1 skipped=0 failed=0 pruned=1' in output
-        assert 'Pruned: Shots/[Creator] Old Name/1.mp4' in output
+        assert '✓ pruned Shots/[Creator] Old Name/1.mp4' in output
         ui = set_final_summary.call_args.args[0]
         assert ui.final_message == 'converted=1 skipped=0 failed=0 pruned=1'
         assert not old_output.exists()

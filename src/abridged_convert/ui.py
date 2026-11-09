@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import re
 import shutil
 from pathlib import Path
-from typing import Iterable, TextIO
+from collections.abc import Iterable
+from typing import TextIO
 
+from abridged_convert.constants import DELETE_LEGEND
 from abridged_convert.discovery import compact_label, relative_label
-from abridged_convert.models import ConversionResult, Job, JobState, VideoEncodingConfig
+from abridged_convert.models import ConversionResult, Job, JobState
 
 
 def summarize_result(result: ConversionResult, repo_root: Path) -> str:
@@ -28,12 +31,28 @@ def summarize_result(result: ConversionResult, repo_root: Path) -> str:
     return " | ".join(details)
 
 
-def encoding_label(encoding: VideoEncodingConfig | None) -> str:
-    if encoding is None:
-        return "Auto remux / encode"
-    if encoding.mode == "copy":
-        return "Stream copy / remux"
-    return "GPU / NVIDIA NVENC" if encoding.mode == "nvidia" else "CPU / libx264"
+RED = "\x1b[31m"
+WHITE = "\x1b[37m"
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+
+
+def removal_line(path: str, note: str, *, verb: str, color: bool) -> str:
+    """An end-of-run row for a removed file, styled like the done rows: red badge, white path, dim note."""
+    if not color:
+        return f"✓ {verb} {path} {note}".rstrip()
+    suffix = f" {DIM}{note}{RESET}" if note else ""
+    return f"{RED}✓ {verb}{RESET} {WHITE}{path}{RESET}{suffix}"
+
+
+def deleted_file_line(relpath: str, reason: str, *, dry_run: bool, color: bool) -> str:
+    if dry_run:
+        return removal_line(relpath, f"deploy dry run ({reason})", verb="removing", color=color)
+    return removal_line(relpath, f"deleted ({reason})", verb="removed", color=color)
+
+
+# Remux vs. encode is decided per file, so the UI only ever shows the automatic mode.
+ENCODING_LABEL = "Auto remux / encode"
 
 
 class TerminalUI:
@@ -64,16 +83,14 @@ class TerminalUI:
         *,
         repo_root: Path,
         categories: list[str],
-        encoding: VideoEncodingConfig | None,
         jobs: list[Job],
         discovery_failures: list[ConversionResult],
-        persist_final_report: bool,
+        dry_run: bool,
         stream: TextIO,
     ) -> None:
         self.repo_root = repo_root
         self.categories = categories
-        self.encoding = encoding
-        self.persist_final_report = persist_final_report
+        self.dry_run = dry_run
         self.stream = stream
         self.enabled = bool(getattr(stream, "isatty", lambda: False)()) and os.environ.get("TERM") != "dumb"
         self.phase = "Preparing"
@@ -118,8 +135,6 @@ class TerminalUI:
         self.render()
         self.close()
         self._print_processed_report()
-        if self.persist_final_report:
-            self._print_persistent_report(exit_code)
 
     def close(self) -> None:
         if not self.enabled or not self._active:
@@ -127,14 +142,12 @@ class TerminalUI:
         self._active = False
         self.stream.write(self.ANSI_RESET + self.ANSI_SHOW_CURSOR + self.ANSI_EXIT_ALT_SCREEN)
         self.stream.flush()
-        try:
+        with contextlib.suppress(ValueError):
             atexit.unregister(self.close)
-        except ValueError:
-            pass
 
     def _print_start_message(self) -> None:
         self.stream.write(
-            f"Starting abridged-convert | encoder={encoding_label(self.encoding)}"
+            f"Starting abridged-convert | encoder={ENCODING_LABEL}"
             f" | categories={','.join(self.categories)} | items={len(self.states)}\n"
         )
         self.stream.flush()
@@ -179,11 +192,17 @@ class TerminalUI:
 
     def add_pruned_items(self, cache_keys: Iterable[str]) -> None:
         for cache_key in cache_keys:
-            self.states.append(JobState(label=cache_key, detail="pruned", status="pruned"))
+            self.states.append(JobState(label=cache_key, detail="", status="pruned"))
             if not self.enabled:
-                self.stream.write(f"Pruned: {cache_key}\n")
+                self.stream.write(removal_line(cache_key, "", verb="pruned", color=False) + "\n")
         if not self.enabled:
             self.stream.flush()
+        self.render()
+
+    def add_deleted_items(self, deleted_files: Iterable[tuple[str, str]]) -> None:
+        """Remote files the deploy deleted (or, in a dry run, would delete), each with its DELETE_* reason."""
+        for relpath, reason in deleted_files:
+            self.states.append(JobState(label=relpath, detail=reason, status="deleted"))
         self.render()
 
     def print_result_line(self, result: ConversionResult) -> None:
@@ -201,7 +220,7 @@ class TerminalUI:
 
     def _build_frame(self) -> str:
         lines = [
-            self._pill("MODE", encoding_label(self.encoding), self.ANSI_BG_MAGENTA),
+            self._pill("MODE", ENCODING_LABEL, self.ANSI_BG_MAGENTA),
             " ".join(
                 [
                     self._pill("DONE", str(self.completed), self.ANSI_BG_GREEN),
@@ -222,8 +241,9 @@ class TerminalUI:
     def _queue_lines(self) -> list[str]:
         height = shutil.get_terminal_size((120, 40)).lines
         max_queue_lines = max(8, height - 8)
-        visible_states = [state for state in self.states if state.status != "pending"][-max_queue_lines:]
-        extra = max(0, len([state for state in self.states if state.status != "pending"]) - len(visible_states))
+        started_states = [state for state in self.states if state.status != "pending"]
+        visible_states = started_states[-max_queue_lines:]
+        extra = len(started_states) - len(visible_states)
         lines = [self._format_state_line(state) for state in visible_states]
         if not lines:
             lines.append(f"{self.ANSI_DIM}Waiting for the first file to start…{self.ANSI_RESET}")
@@ -248,9 +268,10 @@ class TerminalUI:
         if state.status == "failed":
             suffix = f" {self.ANSI_DIM}{state.detail}{self.ANSI_RESET}" if state.detail else ""
             return f"{self._status_badge('✗', 'failed', self.ANSI_RED)} {label}{suffix}"
+        if state.status == "deleted":
+            return deleted_file_line(state.label, state.detail, dry_run=self.dry_run, color=True)
         if state.status == "pruned":
-            suffix = f" {self.ANSI_DIM}{state.detail}{self.ANSI_RESET}" if state.detail else ""
-            return f"{self._status_badge('-', 'pruned', self.ANSI_YELLOW)} {label}{suffix}"
+            return removal_line(state.label, state.detail, verb="pruned", color=True)
         return ""
 
     def _state_for_job(self, job: Job) -> JobState:
@@ -278,49 +299,18 @@ class TerminalUI:
             count=1,
         )
 
-    def _plain_status_label(self, state: JobState) -> str:
-        if state.status == "running":
-            return "RUN"
-        if state.status == "done":
-            return "OK"
-        if state.status == "skipped":
-            return "SKIP"
-        if state.status == "failed":
-            return "FAIL"
-        if state.status == "pruned":
-            return "PRUNE"
-        return "PEND"
-
-    def _plain_state_line(self, state: JobState) -> str:
-        details = [f"[{self._plain_status_label(state)}] {state.label}"]
-        if state.detail and state.detail != "queued":
-            details.append(state.detail)
-        if state.message:
-            details.append(state.message)
-        return " | ".join(details)
-
     def _print_processed_report(self) -> None:
-        processed_states = [state for state in self.states if state.status in {"done", "failed", "pruned"}]
+        processed_states = [state for state in self.states if state.status in {"done", "failed", "pruned", "deleted"}]
         if not processed_states:
             return
 
+        title = "Dry run" if self.dry_run else "Processed"
         lines = [
-            f"{self.ANSI_BOLD}Processed{self.ANSI_RESET}",
+            f"{self.ANSI_BOLD}{title}{self.ANSI_RESET} {self.ANSI_DIM}{','.join(self.categories)}{self.ANSI_RESET}",
             *(self._format_state_line(state) for state in processed_states),
-            "",
         ]
-        self.stream.write("\n".join(lines) + "\n")
-        self.stream.flush()
-
-    def _print_persistent_report(self, exit_code: int) -> None:
-        lines = [
-            "Dry-run queue summary",
-            f"Result: {'FAIL' if exit_code else 'OK'}",
-            f"Encoder: {encoding_label(self.encoding)}",
-            f"Categories: {','.join(self.categories)}",
-            f"Summary: {self.final_message or 'converted=0 skipped=0 failed=0'}",
-            "",
-        ]
-        lines.extend(self._plain_state_line(state) for state in self.states)
+        if any(state.status == "deleted" for state in processed_states):
+            lines.append(f"{self.ANSI_DIM}{DELETE_LEGEND}{self.ANSI_RESET}")
+        lines.append("")
         self.stream.write("\n".join(lines) + "\n")
         self.stream.flush()

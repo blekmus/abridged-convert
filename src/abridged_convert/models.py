@@ -56,6 +56,16 @@ class ConversionResult:
     mapped_tags: list[str] = field(default_factory=list)
     message: str = ""
 
+    @classmethod
+    def for_job(cls, job: Job, **fields: object) -> ConversionResult:
+        return cls(
+            category=job.category,
+            entry_dir=job.entry_dir,
+            source_video=job.source_video,
+            output_file=job.output_file,
+            **fields,
+        )
+
 
 @dataclass(frozen=True)
 class VideoEncodingConfig:

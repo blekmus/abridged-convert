@@ -105,6 +105,15 @@ are considered, never other files at the remote root. If most of the remote
 looks orphaned, deploy deletes nothing and prints a warning instead, because
 that points to a broken catalog rather than stray files.
 
+The end-of-run report lists every remote file deploy (or
+`rebuild-metadata --upload`) deleted as `✓ removed <path> deleted (<reason>)`,
+or with `--dry-run` as `✓ removing <path> deploy dry run (<reason>)`. The reason
+is `removed entry` (the entry's source is gone or was replaced), `orphan` (no
+catalog entry references it) or `stale subtitle` (a re-conversion replaced the
+sidecar). Locally pruned outputs from `convert` are listed as `✓ pruned <path>`.
+On a terminal the verb is red, the path white and the note dim; `NO_COLOR` /
+`FORCE_COLOR` override that.
+
 When there are no changed entries and no dangling remote entries to prune,
 deploy skips uploading the metadata file because the remote metadata would be
 unchanged. When entries are pruned, deploy deletes the recorded remote

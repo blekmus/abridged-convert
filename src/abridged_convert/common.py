@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, Literal, overload
+from collections.abc import Iterable
+from typing import Any, Literal, overload
 
 from abridged_convert.constants import CATEGORY_ORDER
 from abridged_convert.models import ConversionError

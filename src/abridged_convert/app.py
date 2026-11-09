@@ -9,10 +9,10 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 
 from abridged_convert.common import normalize_categories, source_signature
-from abridged_convert.constants import CATEGORY_ORDER
+from abridged_convert.constants import CATEGORY_ORDER, DELETE_LEGEND
 from abridged_convert.conversion import convert_job
 from abridged_convert.deploy import (
     DeployJobPlan,
@@ -27,7 +27,7 @@ from abridged_convert.deploy import (
     relative_output_key,
 )
 from abridged_convert.discovery import discover_jobs, resolve_input_roots
-from abridged_convert.help_format import ColorArgumentParser
+from abridged_convert.help_format import DIM, RESET, ColorArgumentParser, color_enabled
 from abridged_convert.media import cover_output_path_for_job, resolve_video_handling_plan, validate_tools
 from abridged_convert.metadata import (
     SUBTITLES_KEY,
@@ -38,7 +38,7 @@ from abridged_convert.metadata import (
     update_metadata_cache_item_with_tracking,
 )
 from abridged_convert.models import ConversionError, ConversionResult, Job, VideoEncodingConfig
-from abridged_convert.ui import TerminalUI
+from abridged_convert.ui import TerminalUI, deleted_file_line
 
 
 PROG = "abridged-convert"
@@ -332,6 +332,19 @@ def print_deploy_summary(summary: DeploySummary, *, remote: str | None) -> None:
     )
 
 
+def print_deleted_files(summary: DeploySummary, *, dry_run: bool) -> None:
+    """List every deleted remote file when there is no full-screen UI to show them (piped output, rebuild-metadata).
+
+    Uses the same rows as the UI's final report.
+    """
+    if not summary.deleted_files:
+        return
+    color = color_enabled(sys.stdout)
+    for relpath, reason in summary.deleted_files:
+        print(deleted_file_line(relpath, reason, dry_run=dry_run, color=color), file=sys.stdout)
+    print(f"{DIM}{DELETE_LEGEND}{RESET}" if color else DELETE_LEGEND, file=sys.stdout)
+
+
 def finalize_deploy_plan_for_conversion(
     plan: DeployJobPlan,
     ffprobe_bin: str,
@@ -350,7 +363,7 @@ def finalize_deploy_plan_for_conversion(
     )
 
 
-def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: object, next_plan: DeployJobPlan) -> None:
+def replace_deploy_context_plan(plans: list[DeployJobPlan], original_job: Job, next_plan: DeployJobPlan) -> None:
     for index, plan in enumerate(plans):
         if plan.job is original_job or str(plan.job.source_video) == str(next_plan.job.source_video):
             plans[index] = next_plan
@@ -418,6 +431,7 @@ def run_rebuild_metadata(options: RunOptions, log) -> int:
         f"metadata={summary.metadata_path}",
         file=sys.stdout,
     )
+    print_deleted_files(summary, dry_run=options.dry_run)
     return 0
 
 
@@ -523,10 +537,9 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
         ui = TerminalUI(
             repo_root=input_dir,
             categories=categories,
-            encoding=None,
             jobs=jobs,
             discovery_failures=discovery_failures,
-            persist_final_report=options.dry_run,
+            dry_run=options.dry_run,
             stream=sys.stdout,
         )
         ui.start()
@@ -561,7 +574,6 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
         failures = len(discovery_failures)
         skipped = 0
         converted = 0
-        successful_deploy_outputs: set[str] = set()
         metadata_discovered = 0
         metadata_reused = 0
         metadata_probed = 0
@@ -587,15 +599,7 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
         for job in jobs:
             deploy_plan = deploy_plan_by_job.get((str(job.source_video), str(job.output_file)))
             if deploy_context is not None and deploy_plan is not None and not deploy_plan.changed:
-                result = ConversionResult(
-                    category=job.category,
-                    entry_dir=job.entry_dir,
-                    source_video=job.source_video,
-                    output_file=job.output_file,
-                    success=True,
-                    skipped=True,
-                    message=deploy_plan.reason,
-                )
+                result = ConversionResult.for_job(job, success=True, skipped=True, message=deploy_plan.reason)
                 ui.mark_result(job, result)
                 ui.print_result_line(result)
                 skipped += 1
@@ -611,11 +615,8 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
                         encoding_by_job,
                     )
                     replace_deploy_context_plan(deploy_context.plans, job, deploy_plan)
-                result = ConversionResult(
-                    category=job.category,
-                    entry_dir=job.entry_dir,
-                    source_video=job.source_video,
-                    output_file=job.output_file,
+                result = ConversionResult.for_job(
+                    job,
                     success=True,
                     message=f"deploy dry run ({deploy_plan.reason if deploy_plan else 'planned'})",
                 )
@@ -626,12 +627,7 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
 
             if deploy_context is not None and deploy_plan is not None and deploy_plan.subtitles_only:
                 ui.mark_running(job)
-                result = ConversionResult(
-                    category=job.category,
-                    entry_dir=job.entry_dir,
-                    source_video=job.source_video,
-                    output_file=job.output_file,
-                )
+                result = ConversionResult.for_job(job)
                 try:
                     subtitle_keys = backfill_subtitles(
                         options.rclone,
@@ -649,25 +645,15 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
                     result.skipped = True
                     result.message = f"subtitles backfilled ({len(subtitle_keys)})"
                     skipped += 1
-                    successful_deploy_outputs.add(deploy_plan.output_key)
                 ui.mark_result(job, result)
                 ui.print_result_line(result)
                 continue
 
             if deploy_context is not None and deploy_plan is not None and not deploy_plan.needs_conversion:
-                result = ConversionResult(
-                    category=job.category,
-                    entry_dir=job.entry_dir,
-                    source_video=job.source_video,
-                    output_file=job.output_file,
-                    success=True,
-                    skipped=True,
-                    message=deploy_plan.reason,
-                )
+                result = ConversionResult.for_job(job, success=True, skipped=True, message=deploy_plan.reason)
                 ui.mark_result(job, result)
                 ui.print_result_line(result)
                 skipped += 1
-                successful_deploy_outputs.add(deploy_plan.output_key)
                 continue
 
             display_job = job
@@ -708,7 +694,6 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
                         metadata_discovered += 1
                         metadata_output_path = deploy_context.metadata_path
                         metadata_probed += 1
-                        successful_deploy_outputs.add(deploy_plan.output_key)
                 if deploy_context is None and not options.dry_run:
                     output_key = cache_key_for_path(output_dir, result.output_file)
                     deploy_item = {
@@ -747,8 +732,6 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
             deploy_summary = finalize_deploy(
                 rclone_bin=options.rclone,
                 context=deploy_context,
-                ffprobe_bin=options.ffprobe,
-                successful_output_keys=successful_deploy_outputs,
                 dry_run=options.dry_run,
                 keep_staging=False,
                 input_root=input_dir,
@@ -773,6 +756,8 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
             metadata_output_path = metadata_output_path or prune_summary.output_path
 
         ui.add_pruned_items(metadata_pruned_keys)
+        if deploy_summary is not None:
+            ui.add_deleted_items(deploy_summary.deleted_files)
         ui.set_final_summary(converted=converted, skipped=skipped, failed=failures, pruned=metadata_pruned)
         ui.finish(1 if failures else 0)
         print(
@@ -791,6 +776,8 @@ def _run(options: RunOptions, stack: ExitStack) -> int:
             )
         if deploy_summary is not None:
             print_deploy_summary(deploy_summary, remote=options.remote)
+            if not ui.enabled:  # the full-screen UI already listed them in its final report
+                print_deleted_files(deploy_summary, dry_run=options.dry_run)
         return 1 if failures else 0
     except ConversionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+from abridged_convert.constants import IMAGE_EXTENSIONS
+
 BRACKET_ID_PATTERN = re.compile(r"\[([A-Za-z0-9_-]{6,})\]")
 TITLE_HINT_PATTERN = re.compile(
     r"(?:episodes|episode|ova|movie|finale)\s*[\d.,~ ]*(?:-|:)?\s*(?P<title>.+)",
@@ -35,8 +35,6 @@ AMBIGUITY_EPSILON = 1e-9
 @dataclass(frozen=True)
 class CoverCandidateMatch:
     path: Path
-    full_norm: str
-    title_norm: str
     shared_ids: tuple[str, ...]
     shared_episode_refs: tuple[str, ...]
     exact_full_match: bool
@@ -48,7 +46,6 @@ class CoverCandidateMatch:
     repo_score_norm: float
     hybrid_score: float
     strategy: str
-    metrics: dict[str, float]
 
 
 def tokenize(value: str) -> list[str]:
@@ -260,10 +257,6 @@ def sorensen_dice(left: str, right: str) -> float:
     return (2.0 * overlap) / (len(left_bigrams) + len(right_bigrams))
 
 
-def sequence_ratio(left: str, right: str) -> float:
-    return SequenceMatcher(None, left, right).ratio()
-
-
 def jaro_winkler(left: str, right: str) -> float:
     if left == right:
         return 1.0
@@ -309,7 +302,7 @@ def jaro_winkler(left: str, right: str) -> float:
     ) / 3.0
 
     prefix = 0
-    for left_char, right_char in zip(left, right):
+    for left_char, right_char in zip(left, right, strict=False):
         if left_char != right_char or prefix == 4:
             break
         prefix += 1
@@ -338,8 +331,15 @@ def token_overlap(left: str, right: str) -> float:
 
 
 def smart_title_score(source_stem: str, candidate_stem: str, *, allow_title_containment: bool = False) -> float:
-    source_title = extract_title(source_stem)
-    candidate_title = extract_title(candidate_stem)
+    return title_similarity_score(
+        extract_title(source_stem),
+        extract_title(candidate_stem),
+        allow_title_containment=allow_title_containment,
+    )
+
+
+def title_similarity_score(source_title: str, candidate_title: str, *, allow_title_containment: bool = False) -> float:
+    """Similarity of two titles already passed through `extract_title`."""
     if not source_title or not candidate_title:
         return 0.0
 
@@ -376,10 +376,7 @@ def _strategy_for_scores(
     shared_ids: tuple[str, ...],
     shared_episode_refs: tuple[str, ...],
 ) -> str:
-    if shared_ids and id_score > 0.0:
-        strategy_scores = {"shared_id": id_score}
-    else:
-        strategy_scores = {}
+    strategy_scores = {"shared_id": id_score} if shared_ids and id_score > 0.0 else {}
     if exact_episode_match and numeric_path > 0.0:
         strategy_scores["episode_number"] = numeric_path
     if len(shared_episode_refs) >= 2 and reference_path > 0.0:
@@ -438,9 +435,9 @@ def evaluate_candidates(
         exact_episode_match = bool(source_episode and source_episode in candidate_refs)
         reference_overlap = (len(shared_refs) / len(source_refs)) if source_refs else 0.0
 
-        title_similarity = smart_title_score(
-            source_video.stem,
-            candidate.stem,
+        title_similarity = title_similarity_score(
+            source_title,
+            candidate_title,
             allow_title_containment=allow_title_containment,
         )
         full_similarity = (
@@ -484,31 +481,9 @@ def evaluate_candidates(
             shared_episode_refs=shared_refs,
         )
 
-        metrics = {
-            "levenshtein_full": normalized_levenshtein(source_full, candidate_full) if source_full or candidate_full else 0.0,
-            "dice_full": sorensen_dice(source_full, candidate_full) if source_full or candidate_full else 0.0,
-            "lev_dice_full_avg": full_similarity,
-            "lev_dice_title_avg": (
-                (normalized_levenshtein(source_title, candidate_title) + sorensen_dice(source_title, candidate_title)) / 2.0
-                if source_title or candidate_title
-                else 0.0
-            ),
-            "sequence_ratio_full": sequence_ratio(source_full, candidate_full) if source_full or candidate_full else 0.0,
-            "jaro_winkler_title": jaro_winkler(source_title, candidate_title) if source_title or candidate_title else 0.0,
-            "token_jaccard_title": token_jaccard(source_title, candidate_title) if source_title or candidate_title else 0.0,
-            "token_overlap_title": token_overlap(source_title, candidate_title) if source_title or candidate_title else 0.0,
-            "smart_title_score": title_similarity,
-            "repo_score_norm": repo_score_norm,
-            "hybrid_score": hybrid_score,
-            "reference_overlap": reference_overlap,
-            "id_match": 1.0 if candidate_ids else 0.0,
-        }
-
         results.append(
             CoverCandidateMatch(
                 path=candidate,
-                full_norm=candidate_full,
-                title_norm=candidate_title,
                 shared_ids=candidate_ids,
                 shared_episode_refs=shared_refs,
                 exact_full_match=exact_full_match,
@@ -520,7 +495,6 @@ def evaluate_candidates(
                 repo_score_norm=repo_score_norm,
                 hybrid_score=hybrid_score,
                 strategy=strategy,
-                metrics=metrics,
             )
         )
 
@@ -554,6 +528,7 @@ def find_best_cover(
 
 
 __all__ = [
+    "MINIMUM_HYBRID_COVER_SCORE",
     "CoverCandidateMatch",
     "evaluate_candidates",
     "extract_content_ids",
@@ -564,14 +539,13 @@ __all__ = [
     "jaro_winkler",
     "legacy_series_cover_score",
     "levenshtein_distance",
-    "MINIMUM_HYBRID_COVER_SCORE",
     "normalize_text",
     "normalized_levenshtein",
     "parse_series_name",
-    "sequence_ratio",
     "smart_title_score",
     "sorensen_dice",
-    "tokenize",
+    "title_similarity_score",
     "token_jaccard",
     "token_overlap",
+    "tokenize",
 ]

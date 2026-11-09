@@ -6,10 +6,12 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from abridged_convert.common import normalize_scope, path_in_scope, scope_categories
 from abridged_convert.constants import CATEGORY_ORDER, VIDEO_EXTENSIONS
+from abridged_convert.discovery import find_top_level_dirs
 from abridged_convert.models import ConversionError
 
 
@@ -56,7 +58,7 @@ def update_metadata_cache_item_with_tracking(
     cache_path = resolved_archive_root / METADATA_CACHE_FILENAME
     cache_key = cache_key_for_path(resolved_archive_root, video_path)
     existing_items = load_cache_items(cache_path)
-    existing_deploy_items = load_cache_deploy_items(cache_path)
+    existing_deploy_items = deploy_items_from_metadata(existing_items)
     existing_item = existing_items.get(cache_key)
     stat = video_path.stat()
     size = stat.st_size
@@ -94,7 +96,7 @@ def prune_missing_metadata_cache_items(
     if not existing_items:
         return MetadataPruneSummary(pruned=0, output_path=cache_path, written=False)
 
-    existing_deploy_items = load_cache_deploy_items(cache_path)
+    existing_deploy_items = deploy_items_from_metadata(existing_items)
     selected_scope = normalize_scope(scope)
     discovered_keys = {
         cache_key_for_path(resolved_archive_root, video_path)
@@ -129,7 +131,7 @@ def prune_unexpected_metadata_cache_items(
     if not existing_items:
         return MetadataPruneSummary(pruned=0, output_path=cache_path, written=False)
 
-    existing_deploy_items = load_cache_deploy_items(cache_path)
+    existing_deploy_items = deploy_items_from_metadata(existing_items)
     selected_scope = normalize_scope(scope)
     next_items: dict[str, dict[str, Any]] = {}
     pruned_items: list[tuple[str, dict[str, Any]]] = []
@@ -184,7 +186,7 @@ def discover_archive_videos(archive_root: Path, *, categories: Iterable[str] | N
 
     series_root = archive_root / "Series"
     if "Series" in selected_categories and series_root.is_dir():
-        for entry_dir in top_level_dirs(series_root):
+        for entry_dir in find_top_level_dirs(series_root):
             videos.extend(
                 sorted(
                     child
@@ -199,19 +201,19 @@ def discover_archive_videos(archive_root: Path, *, categories: Iterable[str] | N
         category_root = archive_root / category
         if not category_root.is_dir():
             continue
-        for entry_dir in top_level_dirs(category_root):
+        for entry_dir in find_top_level_dirs(category_root):
             videos.extend(find_canonical_output_videos(entry_dir))
 
     songs_root = archive_root / "Songs"
     if "Songs" in selected_categories and songs_root.is_dir():
-        for entry_dir in top_level_dirs(songs_root):
+        for entry_dir in find_top_level_dirs(songs_root):
             if entry_dir.name == "AMV":
                 continue
             videos.extend(find_canonical_output_videos(entry_dir))
 
         amv_root = songs_root / "AMV"
         if amv_root.is_dir():
-            for entry_dir in top_level_dirs(amv_root):
+            for entry_dir in find_top_level_dirs(amv_root):
                 videos.extend(find_canonical_output_videos(entry_dir))
 
     return videos
@@ -223,10 +225,6 @@ def find_canonical_output_videos(entry_dir: Path) -> list[Path]:
         for child in entry_dir.iterdir()
         if child.is_file() and child.stem == "1" and child.suffix.lower() in VIDEO_EXTENSIONS
     )
-
-
-def top_level_dirs(root: Path) -> list[Path]:
-    return sorted(path for path in root.iterdir() if path.is_dir())
 
 
 def load_cache_document(cache_path: Path) -> dict[str, Any]:
@@ -246,31 +244,15 @@ def load_cache_document(cache_path: Path) -> dict[str, Any]:
 
 
 def load_cache_items(cache_path: Path) -> dict[str, dict[str, Any]]:
-    cache = load_cache_document(cache_path)
-    if not cache:
-        return {}
-    items = cache.get("items")
+    items = load_cache_document(cache_path).get("items")
     if not isinstance(items, dict):
         return {}
-
     return {key: value for key, value in items.items() if isinstance(key, str) and isinstance(value, dict)}
 
 
-def load_cache_deploy_items(cache_path: Path) -> dict[str, dict[str, Any]]:
-    cache = load_cache_document(cache_path)
-    if not cache:
-        return {}
-
-    items = cache.get("items")
-    if not isinstance(items, dict):
-        return {}
-
-    merged_items = {
-        key: deploy_state_from_metadata_item(value)
-        for key, value in items.items()
-        if isinstance(key, str) and isinstance(value, dict)
-    }
-    return {key: value for key, value in merged_items.items() if value is not None}
+def deploy_items_from_metadata(items: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    states = {key: deploy_state_from_metadata_item(item) for key, item in items.items()}
+    return {key: state for key, state in states.items() if state is not None}
 
 
 def deploy_state_from_metadata_item(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -329,7 +311,7 @@ def probe_video_metadata(ffprobe_bin: str, video_path: Path) -> dict[str, Any] |
             text=True,
         )
         probe = json.loads(completed.stdout)
-    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+    except (subprocess.CalledProcessError, OSError, ValueError):  # ValueError covers JSONDecodeError
         return None
 
     format_data = probe.get("format")
@@ -449,19 +431,17 @@ def write_cache(
     stale_remote_paths: Iterable[str] | None = None,
     include_item_upload_state: bool = True,
 ) -> None:
-    merged_items = {
-        key: dict(value)
-        for key, value in items.items()
-    }
-    if deploy_items is not None:
-        for key, deploy_item in deploy_items.items():
-            if key not in merged_items:
-                continue
+    merged_items = {key: dict(value) for key, value in items.items()}
+    for key, deploy_item in (deploy_items or {}).items():
+        if key in merged_items:
             merge_deploy_tracking(merged_items[key], deploy_item)
+    if not include_item_upload_state:
+        for item in merged_items.values():
+            item.pop(ITEM_UPLOAD_PENDING_KEY, None)
 
     cache = {
         "version": METADATA_CACHE_VERSION,
-        "items": dict(sorted(clean_metadata_items(merged_items, include_upload_state=include_item_upload_state).items())),
+        "items": dict(sorted(merged_items.items())),
     }
     if deploy_run_signature is not None:
         cache[DEPLOY_RUN_SIGNATURE_KEY] = deploy_run_signature
@@ -480,17 +460,3 @@ def write_cache(
         temp_path.unlink(missing_ok=True)
         raise ConversionError(f"failed to write metadata cache: {exc}") from exc
 
-
-def clean_metadata_items(
-    items: dict[str, dict[str, Any]],
-    *,
-    include_upload_state: bool,
-) -> dict[str, dict[str, Any]]:
-    if include_upload_state:
-        return items
-    cleaned: dict[str, dict[str, Any]] = {}
-    for key, item in items.items():
-        next_item = dict(item)
-        next_item.pop(ITEM_UPLOAD_PENDING_KEY, None)
-        cleaned[key] = next_item
-    return cleaned
